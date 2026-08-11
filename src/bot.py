@@ -346,6 +346,9 @@ class RemoteAgentBot(commands.Bot):
             return
         if not self._is_server_owner(message.author.id, message.guild):
             return
+        # A pending "Other" answer is captured by the broker, not a new turn.
+        if message.channel.id in self.broker.awaiting_text:
+            return
         content = message.content
         if content.startswith(self.config.prefix):
             await self.process_commands(message)
