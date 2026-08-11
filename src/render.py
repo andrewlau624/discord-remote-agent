@@ -220,6 +220,18 @@ def command_pages(commands: list[dict]) -> list[discord.Embed]:
     return _field_pages(items, f"Skills ({len(items)})")
 
 
+def repo_pages(repos: list[tuple[str, str, list[tuple[str, str]]]]) -> list[discord.Embed]:
+    """Paginated repos with their checkouts.
+
+    Each item is (name, branch, worktrees) where worktrees is (path, branch)
+    with the main checkout first."""
+    items: list[tuple[str, str]] = []
+    for name, branch, trees in repos:
+        lines = [f"`{b}` {p}" for p, b in trees]
+        items.append((f"📁 {name} ({branch})", "\n".join(lines) or "no checkouts"))
+    return _field_pages(items, f"Repos ({len(items)})", per_page=6)
+
+
 def session_pages(sessions: list, pinned: dict[str, int]) -> list[discord.Embed]:
     """Paginated resumable sessions. `pinned` maps session_id -> channel_id."""
     items: list[tuple[str, str]] = []

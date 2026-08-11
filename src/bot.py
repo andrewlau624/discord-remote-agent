@@ -12,14 +12,21 @@ import discord
 from discord.ext import commands
 
 from src.config import Config
-from src.forum import create_session_thread, ensure_forum, git_info
+from src.forum import (
+    create_session_thread,
+    ensure_forum,
+    git_info,
+    list_repos,
+    list_worktrees,
+    resolve_worktree,
+)
 from src.paginator import paginate
 from src.permissions import DiscordPermissionBroker
 from src.prefs import DisplayPrefs, view_panel
 from src.providers import claude as claude_provider
 from src.providers.base import Provider
 from src.providers.claude import ClaudeProvider
-from src.render import command_pages, history_embeds, session_pages
+from src.render import command_pages, history_embeds, repo_pages, session_pages
 from src.session import Session
 from src.store import Store
 
@@ -36,6 +43,34 @@ MODE_ALIASES = {
     "accept": "acceptEdits",
     "bypass": "bypassPermissions",
 }
+
+
+def _parse_new_args(text: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """Parse `new` arguments into (repo, branch, mode, error).
+
+    Accepts key:value tokens (repo: branch: mode:) in any order. A bare first
+    token is the repo; a bare mode name also works, so `new myrepo bypass`
+    still does what it looks like."""
+    repo = branch = mode = None
+    for tok in text.split():
+        key, sep, val = tok.partition(":")
+        if sep and key.lower() in ("repo", "branch", "mode"):
+            if key.lower() == "repo":
+                repo = val or None
+            elif key.lower() == "branch":
+                branch = val or None
+            else:
+                mode = val or None
+        elif repo is None and MODE_ALIASES.get(tok.lower(), tok) not in (*MODES, "dontAsk"):
+            repo = tok
+        elif mode is None and MODE_ALIASES.get(tok.lower(), tok) in (*MODES, "dontAsk"):
+            mode = tok
+        else:
+            return None, None, None, (
+                f"Unrecognized argument `{tok}`. "
+                "Use `new [repo:<name>] [branch:<branch>] [mode:<mode>]`."
+            )
+    return repo, branch, mode, None
 
 
 class RemoteAgentBot(commands.Bot):
@@ -55,7 +90,6 @@ class RemoteAgentBot(commands.Bot):
         self._tasks: set[asyncio.Task] = set()
         self._prefs_path = str(Path(config.db_path).with_name("prefs.json"))
         self.prefs = DisplayPrefs.load(self._prefs_path)
-        self.broker.auto_accept = self.prefs.auto_accept
 
     async def setup_hook(self) -> None:
         register_chat(self)
@@ -157,13 +191,30 @@ class RemoteAgentBot(commands.Bot):
             except discord.HTTPException:
                 pass
 
-    async def do_new(self, guild: discord.Guild | None, cwd: str | None) -> str:
+    async def do_new(
+        self,
+        guild: discord.Guild | None,
+        cwd: str | None,
+        mode: str | None = None,
+        branch: str | None = None,
+    ) -> str:
         if guild is None:
             return "Run this in a server."
+        mode = MODE_ALIASES.get(mode.lower(), mode) if mode else "default"
+        if mode not in (*MODES, "dontAsk"):
+            return f"Unknown mode. Options: {', '.join(MODES)}."
         provider_name = self.pending_provider.get(guild.id, "claude")
         work_dir = self._resolve_cwd(cwd)
         if not os.path.isdir(work_dir):
             return f"`{work_dir}` is not a directory."
+        if branch:
+            # Reuses an existing checkout of that branch, or creates a
+            # worktree under <repo>/.worktrees/ so the main checkout is
+            # never disturbed. `repos` lists what already exists.
+            try:
+                work_dir = await asyncio.to_thread(resolve_worktree, work_dir, branch)
+            except RuntimeError as exc:
+                return f"Could not prepare a worktree for `{branch}`: `{exc}`"
         session_id = str(uuid.uuid4())
         repo, branch = git_info(work_dir)
         try:
@@ -177,7 +228,12 @@ class RemoteAgentBot(commands.Bot):
 
         try:
             provider = self._make_provider(
-                provider_name, cwd=work_dir, channel_id=thread.id, resume=None, session_id=session_id
+                provider_name,
+                cwd=work_dir,
+                channel_id=thread.id,
+                resume=None,
+                session_id=session_id,
+                mode=mode,
             )
             await provider.start()
         except Exception as exc:
@@ -186,7 +242,12 @@ class RemoteAgentBot(commands.Bot):
             self, self.store, thread.id, provider, provider_name, pre_named=False
         )
         self.store.pin(thread.id, provider_name, provider.session_id or session_id)
-        return f"Started a **{provider_name}** session in {thread.mention}."
+        if mode != "default":
+            self.store.set_mode(thread.id, mode)
+        started = f"Started a **{provider_name}** session in {thread.mention}."
+        if mode != "default":
+            started += f" Mode: **{mode}**."
+        return started
 
     async def do_resume(
         self, guild: discord.Guild | None, session_id: str, cwd: str | None
@@ -325,10 +386,6 @@ class RemoteAgentBot(commands.Bot):
 
     async def _on_pref_change(self, attr: str, value: bool) -> None:
         self.prefs.save(self._prefs_path)
-        if attr == "auto_accept":
-            # Broker-level: applies instantly to every session, no CLI
-            # restriction, and AskUserQuestion still reaches the user.
-            self.broker.auto_accept = value
 
     async def do_skill(
         self, channel: discord.abc.GuildChannel, name: str, args: str | None
@@ -340,6 +397,19 @@ class RemoteAgentBot(commands.Bot):
         text = f"/{clean}" + (f" {args}" if args else "")
         self._spawn(session.handle_message(text))
         return f"Running `/{clean}`"
+
+    async def do_repos(self, channel: discord.abc.Messageable) -> None:
+        base = os.path.expanduser(self.config.default_cwd or self.config.launch_cwd)
+
+        def collect() -> list[tuple[str, str, list[tuple[str, str]]]]:
+            out = []
+            for path in list_repos(base):
+                _, current = git_info(path)
+                out.append((os.path.basename(path), current, list_worktrees(path)))
+            return out
+
+        repos = await asyncio.to_thread(collect)
+        self._spawn(paginate(self, channel, repo_pages(repos)))
 
     async def do_list(self, channel: discord.abc.Messageable) -> None:
         sessions = claude_provider.recent_sessions(100)
@@ -359,13 +429,14 @@ class RemoteAgentBot(commands.Bot):
     def help_text(self) -> str:
         p = self.config.prefix
         rows = [
-            ("new [repo]", "start a session (repo name under the base path, or a full path)"),
+            ("new [repo:X] [branch:Y] [mode:Z]", "start a session; branch runs in a worktree, mode is default/acceptEdits/auto/plan/bypassPermissions"),
+            ("repos", "list repos under the base path with their branches and worktrees"),
             ("resume <id> [cwd]", "resume a session in a thread"),
             ("list", "show resumable sessions"),
             ("skills", "list available skills"),
             ("skill <name> [args]", "run a skill in this session thread"),
             ("mode <name>", "switch permission mode (default, acceptEdits, auto, plan, bypassPermissions)"),
-            ("view", "toggle what shows (thinking, tool calls, tool results) and auto accept"),
+            ("view", "toggle what shows (thinking, tool calls, tool results)"),
             ("provider <name>", "set provider for the next new"),
             ("interrupt", "stop the current turn"),
             ("stop", "end this session and archive its thread"),
@@ -409,8 +480,16 @@ class RemoteAgentBot(commands.Bot):
 
 def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="new")
-    async def new_cmd(ctx: commands.Context, cwd: str | None = None) -> None:
-        await ctx.channel.send(await bot.do_new(ctx.guild, cwd))
+    async def new_cmd(ctx: commands.Context, *, rest: str = "") -> None:
+        repo, branch, mode, err = _parse_new_args(rest)
+        if err:
+            await ctx.channel.send(err)
+            return
+        await ctx.channel.send(await bot.do_new(ctx.guild, repo, mode, branch))
+
+    @bot.command(name="repos")
+    async def repos_cmd(ctx: commands.Context) -> None:
+        await bot.do_repos(ctx.channel)
 
     @bot.command(name="resume")
     async def resume_cmd(
