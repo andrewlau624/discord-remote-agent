@@ -202,10 +202,6 @@ class ClaudeProvider(Provider):
         if tool_name == "AskUserQuestion":
             answer = await self.broker.ask(self.channel_id, tool_input)
             return PermissionResultDeny(message=answer)
-        # Auto accept: approve without polling. Questions above still reach
-        # the user; only tool approvals are skipped.
-        if getattr(self.broker, "auto_accept", False):
-            return PermissionResultAllow()
         allowed, reason = await self.broker.request(
             self.channel_id, tool_name, tool_input
         )

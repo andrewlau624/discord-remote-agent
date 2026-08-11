@@ -1,4 +1,4 @@
-"""Display preferences: which block kinds render, plus auto accept.
+"""Display preferences: which block kinds render.
 
 An interactive reaction panel toggles each setting and shows its current state.
 Prefs persist to a small JSON file so they survive restarts.
@@ -23,10 +23,9 @@ _TOGGLES = [
     ("🧠", "thinking", "Thinking"),
     ("🔧", "tool_calls", "Tool calls"),
     ("📥", "tool_results", "Tool results"),
-    ("⚡", "auto_accept", "Auto accept all tools"),
 ]
 
-_FIELDS = ("thinking", "tool_calls", "tool_results", "auto_accept")
+_FIELDS = ("thinking", "tool_calls", "tool_results")
 
 
 @dataclass
@@ -34,7 +33,6 @@ class DisplayPrefs:
     thinking: bool = True
     tool_calls: bool = True
     tool_results: bool = True
-    auto_accept: bool = False
 
     def shows(self, kind: BlockKind) -> bool:
         """Whether a block of this kind should be rendered. Text, status, and
