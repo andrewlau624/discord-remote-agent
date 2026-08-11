@@ -21,10 +21,6 @@ def _load_dotenv(path: str = ".env") -> None:
         os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
-def _split_csv(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
 def _read_toml(path: str) -> dict:
     p = Path(path)
     if not p.is_file():
@@ -36,7 +32,6 @@ def _read_toml(path: str) -> dict:
 @dataclass(frozen=True)
 class Config:
     token: str
-    owner_ids: frozenset[int]
     guild_id: int | None
     launch_cwd: str
     model: str | None = None
@@ -53,16 +48,6 @@ class Config:
         if not token:
             raise SystemExit(
                 "DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in."
-            )
-
-        try:
-            owner_ids = frozenset(int(x) for x in _split_csv(os.environ.get("OWNER_IDS", "")))
-        except ValueError as exc:
-            raise SystemExit(f"OWNER_IDS must be integer user IDs: {exc}") from exc
-        if not owner_ids:
-            raise SystemExit(
-                "OWNER_IDS is empty. Set at least one Discord user ID or the bot "
-                "will ignore everyone."
             )
 
         guild_raw = os.environ.get("GUILD_ID", "").strip()
@@ -84,7 +69,6 @@ class Config:
 
         return cls(
             token=token,
-            owner_ids=owner_ids,
             guild_id=guild_id,
             launch_cwd=os.getcwd(),
             model=model,

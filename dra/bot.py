@@ -32,9 +32,7 @@ class RemoteAgentBot(commands.Bot):
 
         self.config = config
         self.store = Store(config.db_path)
-        self.broker = DiscordPermissionBroker(
-            self, config.owner_ids, config.approval_timeout
-        )
+        self.broker = DiscordPermissionBroker(self, config.approval_timeout)
         self.sessions: dict[int, Session] = {}  # live pins
         self.pending_provider: dict[int, str] = {}
 
@@ -51,15 +49,16 @@ class RemoteAgentBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, getattr(self.user, "id", "?"))
 
-    def is_owner_id(self, user_id: int) -> bool:
-        return user_id in self.config.owner_ids
+    @staticmethod
+    def _is_server_owner(user_id: int, guild: discord.Guild | None) -> bool:
+        return guild is not None and guild.owner_id == user_id
 
     async def _owner_check(self, interaction: discord.Interaction) -> bool:
-        if self.is_owner_id(interaction.user.id):
+        if self._is_server_owner(interaction.user.id, interaction.guild):
             return True
         try:
             await interaction.response.send_message(
-                "You are not authorized to use this bot.", ephemeral=True
+                "Only the server owner can use this bot.", ephemeral=True
             )
         except discord.HTTPException:
             pass
@@ -108,7 +107,9 @@ class RemoteAgentBot(commands.Bot):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
             return
-        if not self.is_owner_id(message.author.id) or not message.content.strip():
+        if not self._is_server_owner(message.author.id, message.guild):
+            return
+        if not message.content.strip():
             return
         session = self.sessions.get(message.channel.id)
         if session is None:

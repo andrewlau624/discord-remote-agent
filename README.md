@@ -40,8 +40,8 @@ so there is no default path to configure.
    cp .env.example .env
    ```
 
-   Set `DISCORD_TOKEN`, your user id in `OWNER_IDS`, and `GUILD_ID` for your
-   server.
+   Set `DISCORD_TOKEN` and `GUILD_ID` for your server. Only the server owner can
+   use the bot, so there is no allowlist to configure.
 5. Run it:
 
    ```
@@ -71,7 +71,7 @@ Secrets and identity live in `.env`. Everything else is in `config.toml`:
 
 ## Security
 
-This runs commands on your machine. Only the ids in `OWNER_IDS` can drive the
+This runs commands on your machine. Only the Discord server owner can drive the
 bot or vote on approvals, everyone else is ignored. Keep the server private.
 Auto-approved read tools can still read files, so tune `tools.auto_approve` if
 you want tighter control.
