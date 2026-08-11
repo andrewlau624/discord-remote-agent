@@ -1,10 +1,17 @@
 .PHONY: run install clean
 
-run:
-	python3 run.py
+VENV := .venv
+PY := $(VENV)/bin/python
 
-install:
-	python3 -m pip install -r requirements.txt
+$(PY):
+	python3 -m venv $(VENV)
+
+install: $(PY)
+	$(PY) -m pip install --upgrade pip
+	$(PY) -m pip install -r requirements.txt
+
+run: $(PY)
+	$(PY) run.py
 
 clean:
 	rm -rf **/__pycache__ __pycache__ *.pyc
