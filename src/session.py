@@ -1,7 +1,9 @@
 """Per-channel session: forwards input to a provider and renders its output.
 
 A lock serializes turns so quick successive messages queue up instead of
-overlapping on one agent.
+overlapping on one agent. Most blocks are posted as new messages; TASK blocks
+go to the TaskBoard instead, which keeps one live message per subagent or
+workflow and edits it in place.
 """
 
 from __future__ import annotations
@@ -10,9 +12,10 @@ import asyncio
 
 import discord
 
-from src.providers.base import Provider
+from src.providers.base import BlockKind, Provider
 from src.render import render_block
 from src.store import Store
+from src.tasks import TaskBoard
 
 
 class Session:
@@ -32,6 +35,7 @@ class Session:
         self.provider_name = provider_name
         self._lock = asyncio.Lock()
         self._named = pre_named
+        self._board = TaskBoard()
 
     async def _channel(self) -> discord.abc.Messageable | None:
         ch = self._bot.get_channel(self.channel_id)
@@ -50,6 +54,9 @@ class Session:
                 async with channel.typing():
                     async for block in self.provider.run_turn(text):
                         if prefs is not None and not prefs.shows(block.kind):
+                            continue
+                        if block.kind is BlockKind.TASK:
+                            await self._board.apply(channel, block)
                             continue
                         for msg in render_block(block):
                             await channel.send(**msg)
@@ -83,4 +90,5 @@ class Session:
         await self.provider.interrupt()
 
     async def stop(self) -> None:
+        self._board.clear()
         await self.provider.stop()

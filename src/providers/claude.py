@@ -3,21 +3,37 @@
 Holds one connected ClaudeSDKClient per channel. Each message is a turn: query
 then drain the response, mapping SDK blocks to our Block type. Tools not in
 allowed_tools hit can_use_tool, which we send to the broker for approval.
+
+A turn ends at a result frame, but only once no delegated task is still in
+flight. The CLI emits a result when the *turn* ends, not when the *run* ends:
+a subagent or workflow keeps going past it and wakes the parent for a follow-up
+turn later. Stopping at the first result would end the turn while that work is
+still running, leaving its output unread until the next prompt dragged it out.
+TaskLedger tracks the in-flight set so we can tell the two apart.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+from contextlib import suppress
 from typing import Any, AsyncIterator
 
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    Message,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -28,9 +44,56 @@ from claude_agent_sdk import (
     list_sessions,
 )
 
-from src.providers.base import Block, BlockKind, PermissionBroker, Provider
+from src.providers.base import Block, BlockKind, PermissionBroker, Provider, TaskStatus
+
+log = logging.getLogger("src")
 
 _SETTING_SOURCES = ["user", "project", "local"]
+
+# Task types whose completion wakes the parent for a follow-up turn, so a
+# result frame arriving while one is in flight does not end the run. Mirrors
+# the SDK's own DEFERRING_TASK_TYPES: background shells, monitors, and
+# teammates are deliberately excluded because they may never reach a terminal
+# status, and waiting on one would hang the turn forever.
+_DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+
+# Give up on a turn if the stream goes completely quiet for this long while we
+# are still waiting on tasks. Releases the session lock instead of wedging it;
+# whatever arrives late is recovered by _drain_stale on the next turn.
+_IDLE_TIMEOUT = 600.0
+
+# How long the stream must be silent before a backlog drain is considered done.
+_DRAIN_QUIET = 1.0
+
+
+class TaskLedger:
+    """Delegated tasks (subagents, workflows) that are still running.
+
+    Terminal completion can arrive as either a task_notification or a
+    task_updated patch — not every task emits both — so both clear the entry.
+    """
+
+    def __init__(self) -> None:
+        self._inflight: set[str] = set()
+
+    @property
+    def idle(self) -> bool:
+        """True when no delegated task is running, so a result ends the run."""
+        return not self._inflight
+
+    def __len__(self) -> int:
+        return len(self._inflight)
+
+    def observe(self, message: Message) -> None:
+        if isinstance(message, TaskStartedMessage):
+            if message.task_type in _DEFERRING_TASK_TYPES:
+                self._inflight.add(message.task_id)
+        elif isinstance(message, TaskNotificationMessage):
+            self._inflight.discard(message.task_id)
+        elif isinstance(message, TaskUpdatedMessage):
+            if message.status in TERMINAL_TASK_STATUSES:
+                self._inflight.discard(message.task_id)
+
 
 
 def session_cwd(session_id: str) -> str | None:
@@ -153,6 +216,30 @@ def _format_ask_question(tool_input: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _format_task_usage(usage: dict[str, Any] | None) -> str:
+    """One-line usage summary for a delegated task, e.g. '45.2k tokens · 12 tools · 8.3s'."""
+    if not usage:
+        return ""
+    bits: list[str] = []
+    tokens = usage.get("total_tokens")
+    if tokens:
+        bits.append(f"{tokens:,} tokens")
+    tools = usage.get("tool_uses")
+    if tools:
+        bits.append(f"{tools} tools")
+    duration = usage.get("duration_ms")
+    if duration:
+        bits.append(f"{duration / 1000:.1f}s")
+    return " · ".join(bits)
+
+
+def _format_task_progress(message: TaskProgressMessage) -> str:
+    bits = [_format_task_usage(message.usage)]
+    if message.last_tool_name:
+        bits.append(f"last: {message.last_tool_name}")
+    return " · ".join(b for b in bits if b) or "running…"
+
+
 def _format_tool_input(name: str, tool_input: dict[str, Any]) -> str:
     if name == "Bash":
         return str(tool_input.get("command", ""))
@@ -195,6 +282,23 @@ class ClaudeProvider(Provider):
         self.session_id = resume or session_id
         self.permission_mode = permission_mode
         self._client: ClaudeSDKClient | None = None
+        # A background task continuously drains the SDK's message stream into
+        # this queue, and every turn pulls from the queue instead of the
+        # stream directly. This is deliberate, not just convenient: an async
+        # generator (receive_messages()) has no task of its own, so awaiting
+        # it inline and cancelling on an idle timeout would inject
+        # CancelledError into its currently-suspended frame and tear it down
+        # for good — silently killing the stream for the rest of the session.
+        # A dedicated pump task absorbs that: cancelling our *wait* on the
+        # queue (asyncio.Queue.get is cancellation-safe) never touches the
+        # pump, which keeps reading regardless of whether anyone is currently
+        # waiting on it — so nothing is lost between turns either.
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._reader_task: asyncio.Task[None] | None = None
+        self._ledger = TaskLedger()
+        # Set when a turn gives up after _IDLE_TIMEOUT of silence. Cleared by
+        # _drain_stale once it has flushed whatever arrived late.
+        self._stalled = False
 
     async def _can_use_tool(self, tool_name, tool_input, context):  # noqa: ANN001
         # AskUserQuestion is not an approval; poll the user and feed the answer
@@ -222,6 +326,25 @@ class ClaudeProvider(Provider):
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
+        self._reader_task = asyncio.create_task(self._pump())
+
+    async def _pump(self) -> None:
+        """Continuously drain the SDK's message stream into our queue.
+
+        Runs independently of any turn's read timeout — see the comment on
+        `_queue` in __init__ for why this indirection exists. A read failure
+        (the CLI process died, the transport errored) is queued as the
+        exception itself so `_next_message` can surface it to a turn instead
+        of leaving that turn waiting forever.
+        """
+        assert self._client is not None
+        try:
+            async for message in self._client.receive_messages():
+                await self._queue.put(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - forwarded to the consumer, not swallowed
+            await self._queue.put(exc)
 
     async def list_commands(self) -> list[dict[str, Any]]:
         if self._client is None:
@@ -240,15 +363,140 @@ class ClaudeProvider(Provider):
         self.permission_mode = mode
 
     async def run_turn(self, text: str) -> AsyncIterator[Block]:
-        if self._client is None:
+        if self._client is None or self._reader_task is None:
             raise RuntimeError("Provider not started")
+        async for block in self._drain_stale():
+            yield block
         await self._client.query(text)
-        async for message in self._client.receive_response():
+        async for block in self._read_until_run_end():
+            yield block
+
+    async def _next_message(self) -> Any:
+        item = await asyncio.wait_for(self._queue.get(), timeout=_IDLE_TIMEOUT)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def _drain_stale(self) -> AsyncIterator[Block]:
+        """Flush output a prior idle-timeout left unread, if any.
+
+        Pulls from the same stream a fresh turn would use, stopping once it
+        has gone quiet for _DRAIN_QUIET seconds rather than at a single
+        message — a stalled turn may have left more than one message queued.
+        """
+        if not self._stalled:
+            return
+        while True:
+            try:
+                item = await asyncio.wait_for(self._queue.get(), timeout=_DRAIN_QUIET)
+            except TimeoutError:
+                break
+            if isinstance(item, BaseException):
+                # The stream died while we were away. Leave it queued-shaped
+                # for the turn proper to raise rather than losing it here.
+                self._queue.put_nowait(item)
+                break
+            self._ledger.observe(item)
+            for block in self._map(item):
+                yield block
+        self._stalled = False
+
+    async def _read_until_run_end(self) -> AsyncIterator[Block]:
+        """Read messages until the run — not just the turn — ends.
+
+        A ResultMessage ends the *turn*; the run only ends there if no
+        delegated task (subagent, workflow) is still in flight. Otherwise the
+        CLI will wake us with a follow-up turn once it finishes, so we keep
+        reading past it instead of returning early.
+        """
+        while True:
+            try:
+                message = await self._next_message()
+            except TimeoutError:
+                self._stalled = True
+                log.warning(
+                    "Turn stalled: no output for %.0fs with %d task(s) in flight",
+                    _IDLE_TIMEOUT,
+                    len(self._ledger),
+                )
+                yield Block(
+                    BlockKind.ERROR,
+                    title="Turn stalled",
+                    body=(
+                        f"No output for {int(_IDLE_TIMEOUT)}s while waiting on "
+                        f"{len(self._ledger)} task(s). Releasing the session; "
+                        "anything that arrives late will surface at the start "
+                        "of the next message."
+                    ),
+                    is_error=True,
+                )
+                return
+            self._ledger.observe(message)
             for block in self._map(message):
                 yield block
+            if isinstance(message, ResultMessage) and (
+                message.is_error or self._ledger.idle
+            ):
+                return
 
     def _map(self, message: Any) -> list[Block]:
         blocks: list[Block] = []
+
+        if isinstance(message, TaskStartedMessage):
+            blocks.append(
+                Block(
+                    BlockKind.TASK,
+                    title=message.description or "Task",
+                    body="starting…",
+                    task_id=message.task_id,
+                    task_status=TaskStatus.RUNNING,
+                )
+            )
+            return blocks
+
+        if isinstance(message, TaskProgressMessage):
+            blocks.append(
+                Block(
+                    BlockKind.TASK,
+                    title=message.description or "Task",
+                    body=_format_task_progress(message),
+                    task_id=message.task_id,
+                    task_status=TaskStatus.RUNNING,
+                )
+            )
+            return blocks
+
+        if isinstance(message, TaskNotificationMessage):
+            failed = message.status in ("failed", "stopped", "killed")
+            blocks.append(
+                Block(
+                    BlockKind.TASK,
+                    title=message.summary or "Task",
+                    body=_format_task_usage(message.usage),
+                    task_id=message.task_id,
+                    task_status=TaskStatus.FAILED if failed else TaskStatus.DONE,
+                    is_error=failed,
+                )
+            )
+            return blocks
+
+        if isinstance(message, TaskUpdatedMessage):
+            # Terminal completion sometimes arrives only as this patch, with
+            # no task_notification. Non-terminal patches carry nothing worth
+            # rendering, so those are dropped.
+            if message.status in TERMINAL_TASK_STATUSES:
+                failed = message.status in ("failed", "killed")
+                blocks.append(
+                    Block(
+                        BlockKind.TASK,
+                        title="Task",
+                        body=message.status,
+                        task_id=message.task_id,
+                        task_status=TaskStatus.FAILED if failed else TaskStatus.DONE,
+                        is_error=failed,
+                    )
+                )
+            return blocks
 
         if isinstance(message, SystemMessage):
             if message.subtype == "init":
@@ -307,13 +555,16 @@ class ClaudeProvider(Provider):
                         is_error=True,
                     )
                 )
-            else:
+            elif self._ledger.idle:
                 bits = [f"{message.num_turns} turn(s)"]
                 if message.total_cost_usd:
                     bits.append(f"${message.total_cost_usd:.4f}")
                 blocks.append(
                     Block(BlockKind.STATUS, title="Done", body=" · ".join(bits))
                 )
+            # Otherwise this result only ends the turn: delegated tasks are
+            # still running and a follow-up turn is coming, so stay quiet
+            # rather than claiming the run is done.
             return blocks
 
         return blocks
@@ -323,6 +574,11 @@ class ClaudeProvider(Provider):
             await self._client.interrupt()
 
     async def stop(self) -> None:
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._reader_task
+            self._reader_task = None
         if self._client is not None:
             await self._client.disconnect()
             self._client = None
