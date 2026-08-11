@@ -25,6 +25,11 @@ class DiscordPermissionBroker:
     def __init__(self, bot: discord.Client, timeout: int):
         self._bot = bot
         self._timeout = timeout
+        # When True, tool approvals are granted without polling. This lives on
+        # the broker rather than the CLI permission mode because the CLI
+        # refuses runtime switches into bypassPermissions unless the session
+        # was launched with --dangerously-skip-permissions.
+        self.auto_accept = False
         # Channels waiting for a typed "Other" answer. on_message skips
         # forwarding a message here so it becomes the answer, not a new turn.
         self.awaiting_text: set[int] = set()

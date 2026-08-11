@@ -55,6 +55,7 @@ class RemoteAgentBot(commands.Bot):
         self._tasks: set[asyncio.Task] = set()
         self._prefs_path = str(Path(config.db_path).with_name("prefs.json"))
         self.prefs = DisplayPrefs.load(self._prefs_path)
+        self.broker.auto_accept = self.prefs.auto_accept
 
     async def setup_hook(self) -> None:
         register_chat(self)
@@ -76,7 +77,14 @@ class RemoteAgentBot(commands.Bot):
     # ---- providers -------------------------------------------------------
 
     def _make_provider(
-        self, name: str, *, cwd: str, channel_id: int, resume: str | None, session_id: str | None
+        self,
+        name: str,
+        *,
+        cwd: str,
+        channel_id: int,
+        resume: str | None,
+        session_id: str | None,
+        mode: str = "default",
     ) -> Provider:
         if name == "claude":
             return ClaudeProvider(
@@ -88,6 +96,7 @@ class RemoteAgentBot(commands.Bot):
                 model=self.config.model,
                 resume=resume,
                 session_id=session_id,
+                permission_mode=mode,
             )
         raise ValueError(f"Provider '{name}' is not implemented yet.")
 
@@ -97,24 +106,19 @@ class RemoteAgentBot(commands.Bot):
             return None
         cwd = claude_provider.session_cwd(pin.session_id) or self.config.launch_cwd
         provider = self._make_provider(
-            pin.provider, cwd=cwd, channel_id=channel_id, resume=pin.session_id, session_id=None
+            pin.provider,
+            cwd=cwd,
+            channel_id=channel_id,
+            resume=pin.session_id,
+            session_id=None,
+            mode=pin.mode,
         )
         await provider.start()
-        await self._apply_auto_accept(provider)
         session = Session(
             self, self.store, channel_id, provider, pin.provider, pre_named=True
         )
         self.sessions[channel_id] = session
         return session
-
-    async def _apply_auto_accept(self, provider: Provider) -> None:
-        """Start a just-connected session in bypass mode if auto accept is on."""
-        if not self.prefs.auto_accept:
-            return
-        try:
-            await provider.set_mode("bypassPermissions")
-        except Exception as exc:
-            log.warning("Could not apply auto accept: %s", exc)
 
     # ---- shared command logic -------------------------------------------
 
@@ -176,7 +180,6 @@ class RemoteAgentBot(commands.Bot):
                 provider_name, cwd=work_dir, channel_id=thread.id, resume=None, session_id=session_id
             )
             await provider.start()
-            await self._apply_auto_accept(provider)
         except Exception as exc:
             return f"Failed to start: `{exc}`"
         self.sessions[thread.id] = Session(
@@ -220,10 +223,14 @@ class RemoteAgentBot(commands.Bot):
 
         try:
             provider = self._make_provider(
-                provider_name, cwd=work_dir, channel_id=thread.id, resume=session_id, session_id=None
+                provider_name,
+                cwd=work_dir,
+                channel_id=thread.id,
+                resume=session_id,
+                session_id=None,
+                mode=pin.mode if pin else "default",
             )
             await provider.start()
-            await self._apply_auto_accept(provider)
         except Exception as exc:
             return f"Failed to resume: `{exc}`"
         if pin and pin.channel_id != thread.id:
@@ -232,6 +239,8 @@ class RemoteAgentBot(commands.Bot):
             self, self.store, thread.id, provider, provider_name, pre_named=True
         )
         self.store.pin(thread.id, provider_name, session_id)
+        if pin and pin.mode != "default":
+            self.store.set_mode(thread.id, pin.mode)
         self._spawn(self._post_history(thread, session_id))
         return f"Resumed in {thread.mention}."
 
@@ -275,25 +284,51 @@ class RemoteAgentBot(commands.Bot):
         session = self.sessions.get(channel.id) or await self._resume_pin(channel.id)
         if session is None:
             return "No session here. Run this in a session thread."
+        relaunched = False
         try:
-            await session.provider.set_mode(mode)
+            if mode == "bypassPermissions":
+                # The CLI only honors bypass when the session is launched with
+                # it, so restart the provider resuming the same session.
+                await self._relaunch_with_mode(channel.id, session, mode)
+                relaunched = True
+            else:
+                await session.provider.set_mode(mode)
         except Exception as exc:
             return f"Could not switch mode: `{exc}`"
-        return f"Mode set to **{mode}**."
+        self.store.set_mode(channel.id, mode)
+        suffix = " (session relaunched)" if relaunched else ""
+        return f"Mode set to **{mode}**{suffix}. It sticks across restarts."
+
+    async def _relaunch_with_mode(
+        self, channel_id: int, session: Session, mode: str
+    ) -> None:
+        """Restart a session's provider so a launch-only mode can apply."""
+        old = session.provider
+        session_id = old.session_id
+        if not session_id:
+            raise RuntimeError("No session id to resume with yet. Send a message first.")
+        cwd = getattr(old, "cwd", None) or self.config.launch_cwd
+        await old.stop()
+        provider = self._make_provider(
+            session.provider_name,
+            cwd=cwd,
+            channel_id=channel_id,
+            resume=session_id,
+            session_id=None,
+            mode=mode,
+        )
+        await provider.start()
+        session.provider = provider
 
     async def do_view(self, channel: discord.abc.Messageable) -> None:
         self._spawn(view_panel(self, channel, self.prefs, self._on_pref_change))
 
     async def _on_pref_change(self, attr: str, value: bool) -> None:
         self.prefs.save(self._prefs_path)
-        if attr != "auto_accept":
-            return
-        mode = "bypassPermissions" if value else "default"
-        for session in list(self.sessions.values()):
-            try:
-                await session.provider.set_mode(mode)
-            except Exception as exc:
-                log.warning("Could not apply auto accept: %s", exc)
+        if attr == "auto_accept":
+            # Broker-level: applies instantly to every session, no CLI
+            # restriction, and AskUserQuestion still reaches the user.
+            self.broker.auto_accept = value
 
     async def do_skill(
         self, channel: discord.abc.GuildChannel, name: str, args: str | None
