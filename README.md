@@ -17,6 +17,9 @@ Gemini, and opencode can slot in behind the same interface later.
   the allowlist post an Approve/Deny poll first.
 - Pins survive restarts. Send a message in a pinned channel after a restart and
   it resumes on its own, or use `/resume <id>`.
+- Commands work as slash commands or as chat commands with a prefix you set in
+  config (default `!`), so `/list` and `!list` both work.
+- Long lists like `/list` and `/skills` page with ◀ ▶ reactions.
 
 Claude runs through the Claude Agent SDK, so blocks and session data come from
 the SDK. Working directories and titles come from the agent's own session data,
@@ -52,6 +55,7 @@ so there is no default path to configure.
 
 Secrets and identity live in `.env`. Everything else is in `config.toml`:
 
+- `prefix` for chat commands (default `!`)
 - `model` for Claude Code (blank uses the default)
 - `approval_timeout` in seconds
 - `db_path` for the pin database
@@ -60,14 +64,17 @@ Secrets and identity live in `.env`. Everything else is in `config.toml`:
 
 ## Commands
 
-- `/new [cwd]` start a session here (cwd defaults to where the bot runs)
-- `/resume <session_id> [cwd]` resume a session and pin it here
-- `/list` show pinned sessions
-- `/provider <name>` pick the provider for the next `/new`
-- `/skills` list available skills and commands
-- `/skill <name> [args]` run a skill in this session
-- `/interrupt` stop the current turn
-- `/stop` end this channel's session and free it
+Every command works as `/name` or `<prefix>name` (default `!name`).
+
+- `new [cwd]` start a session here (cwd defaults to where the bot runs)
+- `resume <session_id> [cwd]` resume a session and pin it here
+- `list` show resumable sessions (paged), 📌 marks pinned ones
+- `provider <name>` pick the provider for the next `new`
+- `skills` list available skills and commands (paged)
+- `skill <name> [args]` run a skill in this session
+- `interrupt` stop the current turn
+- `stop` end this channel's session and free it
+- `help` list commands (chat command only)
 
 ## Security
 
@@ -81,11 +88,12 @@ you want tighter control.
 ```
 run.py             entrypoint
 config.toml        behavior settings
-dra/config.py      env + toml config
-dra/store.py       sqlite channel pins
-dra/session.py     per-channel turn loop
-dra/permissions.py approval polls
-dra/render.py      blocks to embeds
-dra/bot.py         commands and message handling
-dra/providers/     provider interface + claude
+src/config.py      env + toml config
+src/store.py       sqlite channel pins
+src/session.py     per-channel turn loop
+src/permissions.py approval polls
+src/paginator.py   emoji-react pagination
+src/render.py      blocks to embeds
+src/bot.py         commands and message handling
+src/providers/     provider interface + claude
 ```

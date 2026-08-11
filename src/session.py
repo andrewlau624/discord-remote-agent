@@ -10,9 +10,9 @@ import asyncio
 
 import discord
 
-from dra.providers.base import Provider
-from dra.render import render_block
-from dra.store import Store
+from src.providers.base import Provider
+from src.render import render_block
+from src.store import Store
 
 
 class Session:

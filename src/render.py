@@ -12,7 +12,7 @@ import json
 
 import discord
 
-from dra.providers.base import Block, BlockKind
+from src.providers.base import Block, BlockKind
 
 _CHUNK = 3800  # leave room for code fences under the 4096 limit
 _MAX_EMBEDS = 6  # beyond this, attach the rest as a file
@@ -99,30 +99,40 @@ def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
     return embed
 
 
-def command_embeds(commands: list[dict]) -> list[discord.Embed]:
-    """Render the skill/command list into one or more embeds."""
+def _line_pages(lines: list[str], title: str, per_page: int = 12) -> list[discord.Embed]:
+    if not lines:
+        return [discord.Embed(title=title, description="Nothing to show.", color=0x5865F2)]
+    pages: list[discord.Embed] = []
+    for i in range(0, len(lines), per_page):
+        chunk = "\n".join(lines[i : i + per_page])[:4096]
+        embed = discord.Embed(title=title, description=chunk, color=0x5865F2)
+        pages.append(embed)
+    return pages
+
+
+def command_pages(commands: list[dict]) -> list[discord.Embed]:
+    """Paginated skill/command list."""
     lines: list[str] = []
     for cmd in sorted(commands, key=lambda c: str(c.get("name", ""))):
         name = str(cmd.get("name", "")).strip()
         if not name:
             continue
         desc = " ".join(str(cmd.get("description", "")).split())
-        if len(desc) > 100:
-            desc = desc[:97] + "..."
+        if len(desc) > 90:
+            desc = desc[:87] + "..."
         lines.append(f"`/{name}` {desc}".rstrip())
+    return _line_pages(lines, f"Skills ({len(lines)})")
 
-    if not lines:
-        return [discord.Embed(title="Skills", description="None found.", color=0x5865F2)]
 
-    embeds: list[discord.Embed] = []
-    buf = ""
-    for line in lines:
-        if len(buf) + len(line) + 1 > 3800:
-            embeds.append(discord.Embed(description=buf, color=0x5865F2))
-            buf = ""
-        buf += line + "\n"
-    if buf:
-        embeds.append(discord.Embed(description=buf, color=0x5865F2))
-    embeds[0].title = f"Skills ({len(lines)})"
-    embeds[0].set_footer(text="Run one with /skill <name>")
-    return embeds
+def session_pages(sessions: list, pinned: dict[str, int]) -> list[discord.Embed]:
+    """Paginated resumable sessions. `pinned` maps session_id -> channel_id."""
+    lines: list[str] = []
+    for s in sessions:
+        sid = getattr(s, "session_id", "")
+        title = getattr(s, "custom_title", None) or getattr(s, "summary", None) or ""
+        title = " ".join(str(title).split())[:60]
+        cwd = getattr(s, "cwd", "") or ""
+        mark = "📌" if sid in pinned else "▫️"
+        sep = " · " if title and cwd else ""
+        lines.append(f"{mark} `{sid}`\n{title}{sep}{cwd}")
+    return _line_pages(lines, f"Resumable sessions ({len(lines)})", per_page=8)

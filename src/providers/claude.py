@@ -24,9 +24,10 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
     get_session_info,
+    list_sessions,
 )
 
-from dra.providers.base import Block, BlockKind, PermissionBroker, Provider
+from src.providers.base import Block, BlockKind, PermissionBroker, Provider
 
 _SETTING_SOURCES = ["user", "project", "local"]
 
@@ -35,6 +36,11 @@ def session_cwd(session_id: str) -> str | None:
     """Resolve a session's working directory from Claude's own session data."""
     info = get_session_info(session_id)
     return info.cwd if info else None
+
+
+def recent_sessions(limit: int = 100) -> list:
+    """All resumable sessions, newest first, across every project."""
+    return list_sessions(limit=limit)
 
 
 def _build_options(

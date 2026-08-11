@@ -13,7 +13,7 @@ from typing import Any
 
 import discord
 
-from dra.render import permission_embed
+from src.render import permission_embed
 
 _APPROVE = "✅"
 _DENY = "🛑"

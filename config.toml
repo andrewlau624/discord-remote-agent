@@ -1,6 +1,8 @@
 # Behavior settings. Secrets live in .env, not here.
 
 [bot]
+# Prefix for chat commands (e.g. "!list", "!help"). Slash commands work too.
+prefix = "!"
 # Model for Claude Code. Blank uses Claude Code's default.
 model = ""
 # Seconds to wait for a tool approval before denying.

@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from dra.bot import run
-from dra.config import Config
+from src.bot import run
+from src.config import Config
 
 
 def main() -> None:
