@@ -20,6 +20,8 @@ Gemini, and opencode can slot in behind the same interface later.
   the allowlist post an Approve/Deny poll first.
 - `/stop` ends a session and archives its thread. Threads survive restarts, so
   sending a message in one resumes its session, or use `/resume <id>`.
+- Resuming into a fresh thread replays the prior conversation (the text you and
+  the agent exchanged, not tool calls) so you have the context.
 - Commands work as slash commands or as chat commands with a prefix you set in
   config (default `!`), so `/list` and `!list` both work.
 - Long lists like `/list` and `/skills` page with ◀ ▶ reactions.

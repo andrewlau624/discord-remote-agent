@@ -18,7 +18,7 @@ from src.permissions import DiscordPermissionBroker
 from src.providers import claude as claude_provider
 from src.providers.base import Provider
 from src.providers.claude import ClaudeProvider
-from src.render import command_pages, session_pages
+from src.render import command_pages, history_embeds, session_pages
 from src.session import Session
 from src.store import Store
 
@@ -130,6 +130,20 @@ class RemoteAgentBot(commands.Bot):
         forum = await ensure_forum(guild)
         return await create_session_thread(forum, name, session_id, cwd)
 
+    async def _post_history(self, thread: discord.Thread, session_id: str) -> None:
+        """Replay prior textual conversation into a freshly opened thread."""
+        try:
+            history = claude_provider.textual_history(session_id)
+        except Exception as exc:
+            log.warning("Could not load history: %s", exc)
+            return
+        embeds = history_embeds(history)
+        for embed in embeds:
+            try:
+                await thread.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
     async def do_new(self, guild: discord.Guild | None, cwd: str | None) -> str:
         if guild is None:
             return "Run this in a server."
@@ -207,6 +221,7 @@ class RemoteAgentBot(commands.Bot):
             self, self.store, thread.id, provider, provider_name, pre_named=True
         )
         self.store.pin(thread.id, provider_name, session_id)
+        self._spawn(self._post_history(thread, session_id))
         return f"Resumed in {thread.mention}."
 
     async def do_stop(self, channel: discord.abc.GuildChannel) -> str:

@@ -76,6 +76,39 @@ def render_block(block: Block) -> tuple[list[discord.Embed], list[discord.File]]
     return embeds, files
 
 
+_HISTORY_COLOR = 0x4E5058
+_HISTORY_MAX_EMBEDS = 30
+
+
+def history_embeds(history: list[tuple[str, str]]) -> list[discord.Embed]:
+    """Pack prior (role, text) turns into embeds, newest kept if it overflows."""
+    if not history:
+        return []
+    embeds: list[discord.Embed] = []
+    buf = ""
+
+    def flush() -> None:
+        nonlocal buf
+        if buf.strip():
+            embeds.append(discord.Embed(description=buf.strip()[:4096], color=_HISTORY_COLOR))
+        buf = ""
+
+    for role, text in history:
+        label = "You" if role == "user" else "Claude"
+        block = f"**{label}:** {text}"
+        for part in _chunks(block, _CHUNK):
+            if len(buf) + len(part) + 2 > _CHUNK:
+                flush()
+            buf += part + "\n\n"
+    flush()
+
+    trimmed = len(embeds) > _HISTORY_MAX_EMBEDS
+    if trimmed:
+        embeds = embeds[-_HISTORY_MAX_EMBEDS:]
+    embeds[0].title = "Session history" + (" (earlier turns omitted)" if trimmed else "")
+    return embeds
+
+
 def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
     if tool_name == "Bash":
         body = _fence(str(tool_input.get("command", "")), "bash")

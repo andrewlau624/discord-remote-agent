@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
     get_session_info,
+    get_session_messages,
     list_sessions,
 )
 
@@ -49,6 +50,31 @@ def session_title(session_id: str) -> str | None:
     if not info:
         return None
     return info.custom_title or info.summary or None
+
+
+def textual_history(session_id: str) -> list[tuple[str, str]]:
+    """Prior conversation as (role, text), skipping tool calls and results."""
+    out: list[tuple[str, str]] = []
+    for m in get_session_messages(session_id):
+        message = getattr(m, "message", None)
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "")
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                out.append((role, content))
+            continue
+        if not isinstance(content, list):
+            continue
+        texts = [
+            b["text"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
+        ]
+        if texts:
+            out.append((role, "\n".join(texts)))
+    return out
 
 
 def _build_options(
