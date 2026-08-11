@@ -46,8 +46,11 @@ class Session:
 
         async with self._lock:
             try:
+                prefs = getattr(self._bot, "prefs", None)
                 async with channel.typing():
                     async for block in self.provider.run_turn(text):
+                        if prefs is not None and not prefs.shows(block.kind):
+                            continue
                         embeds, files = render_block(block)
                         for embed in embeds:
                             await channel.send(embed=embed, files=files)

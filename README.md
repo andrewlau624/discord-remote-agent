@@ -25,6 +25,9 @@ Gemini, and opencode can slot in behind the same interface later.
 - Commands work as slash commands or as chat commands with a prefix you set in
   config (default `!`), so `/list` and `!list` both work.
 - Long lists like `/list` and `/skills` page with ◀ ▶ reactions.
+- `/view` opens a panel where you react to toggle which blocks show (thinking,
+  tool calls, tool results) and to flip auto accept, which runs every tool
+  without a poll. The choices persist across restarts.
 
 Claude runs through the Claude Agent SDK, so blocks and session data come from
 the SDK. Working directories and titles come from the agent's own session data,
@@ -80,7 +83,8 @@ Every command works as `/name` or `<prefix>name` (default `!name`).
 - `provider <name>` pick the provider for the next `new`
 - `skills` list available skills and commands (paged)
 - `skill <name> [args]` run a skill in this session
-- `mode <name>` switch permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions`
+- `mode <name>` switch permission mode: `default`, `acceptEdits`, `auto`, `plan`, `bypassPermissions`
+- `view` open a panel to toggle what shows (thinking, tool calls, tool results) and auto accept
 - `interrupt` stop the current turn
 - `stop` end this session and archive its thread
 - `help` list commands (chat command only)

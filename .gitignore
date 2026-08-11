@@ -3,6 +3,7 @@
 *.db
 *.db-journal
 *.sqlite3
+prefs.json
 
 # python
 __pycache__/

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import uuid
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -15,6 +16,7 @@ from src.config import Config
 from src.forum import create_session_thread, ensure_forum, git_info
 from src.paginator import paginate
 from src.permissions import DiscordPermissionBroker
+from src.prefs import DisplayPrefs, view_panel
 from src.providers import claude as claude_provider
 from src.providers.base import Provider
 from src.providers.claude import ClaudeProvider
@@ -27,9 +29,9 @@ log = logging.getLogger("src")
 SUPPORTED_PROVIDERS = ("claude",)
 
 # Permission modes exposed as choices, plus friendly aliases.
-MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
+# "auto" is its own mode (a classifier approves each call), not an alias.
+MODES = ("default", "acceptEdits", "auto", "plan", "bypassPermissions")
 MODE_ALIASES = {
-    "auto": "acceptEdits",
     "edit": "acceptEdits",
     "edits": "acceptEdits",
     "accept": "acceptEdits",
@@ -52,6 +54,8 @@ class RemoteAgentBot(commands.Bot):
         self.sessions: dict[int, Session] = {}
         self.pending_provider: dict[int, str] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._prefs_path = str(Path(config.db_path).with_name("prefs.json"))
+        self.prefs = DisplayPrefs.load(self._prefs_path)
 
     async def setup_hook(self) -> None:
         self.tree.interaction_check = self._owner_check  # type: ignore[assignment]
@@ -116,11 +120,21 @@ class RemoteAgentBot(commands.Bot):
             pin.provider, cwd=cwd, channel_id=channel_id, resume=pin.session_id, session_id=None
         )
         await provider.start()
+        await self._apply_auto_accept(provider)
         session = Session(
             self, self.store, channel_id, provider, pin.provider, pre_named=True
         )
         self.sessions[channel_id] = session
         return session
+
+    async def _apply_auto_accept(self, provider: Provider) -> None:
+        """Start a just-connected session in bypass mode if auto accept is on."""
+        if not self.prefs.auto_accept:
+            return
+        try:
+            await provider.set_mode("bypassPermissions")
+        except Exception as exc:
+            log.warning("Could not apply auto accept: %s", exc)
 
     # ---- shared command logic -------------------------------------------
 
@@ -182,6 +196,7 @@ class RemoteAgentBot(commands.Bot):
                 provider_name, cwd=work_dir, channel_id=thread.id, resume=None, session_id=session_id
             )
             await provider.start()
+            await self._apply_auto_accept(provider)
         except Exception as exc:
             return f"Failed to start: `{exc}`"
         self.sessions[thread.id] = Session(
@@ -228,6 +243,7 @@ class RemoteAgentBot(commands.Bot):
                 provider_name, cwd=work_dir, channel_id=thread.id, resume=session_id, session_id=None
             )
             await provider.start()
+            await self._apply_auto_accept(provider)
         except Exception as exc:
             return f"Failed to resume: `{exc}`"
         if pin and pin.channel_id != thread.id:
@@ -274,7 +290,7 @@ class RemoteAgentBot(commands.Bot):
 
     async def do_mode(self, channel: discord.abc.GuildChannel, mode: str) -> str:
         mode = MODE_ALIASES.get(mode.lower(), mode)
-        if mode not in ("default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"):
+        if mode not in (*MODES, "dontAsk"):
             return f"Unknown mode. Options: {', '.join(MODES)}."
         session = self.sessions.get(channel.id) or await self._resume_pin(channel.id)
         if session is None:
@@ -284,6 +300,20 @@ class RemoteAgentBot(commands.Bot):
         except Exception as exc:
             return f"Could not switch mode: `{exc}`"
         return f"Mode set to **{mode}**."
+
+    async def do_view(self, channel: discord.abc.Messageable) -> None:
+        self._spawn(view_panel(self, channel, self.prefs, self._on_pref_change))
+
+    async def _on_pref_change(self, attr: str, value: bool) -> None:
+        self.prefs.save(self._prefs_path)
+        if attr != "auto_accept":
+            return
+        mode = "bypassPermissions" if value else "default"
+        for session in list(self.sessions.values()):
+            try:
+                await session.provider.set_mode(mode)
+            except Exception as exc:
+                log.warning("Could not apply auto accept: %s", exc)
 
     async def do_skill(
         self, channel: discord.abc.GuildChannel, name: str, args: str | None
@@ -319,7 +349,8 @@ class RemoteAgentBot(commands.Bot):
             ("list", "show resumable sessions"),
             ("skills", "list available skills"),
             ("skill <name> [args]", "run a skill in this session thread"),
-            ("mode <name>", "switch permission mode (default, acceptEdits, plan, bypassPermissions)"),
+            ("mode <name>", "switch permission mode (default, acceptEdits, auto, plan, bypassPermissions)"),
+            ("view", "toggle what shows (thinking, tool calls, tool results) and auto accept"),
             ("provider <name>", "set provider for the next new"),
             ("interrupt", "stop the current turn"),
             ("stop", "end this session and archive its thread"),
@@ -413,6 +444,12 @@ def register_slash(bot: RemoteAgentBot) -> None:
         msg = await bot.do_mode(interaction.channel, mode.value)
         await interaction.response.send_message(msg, ephemeral=True)
 
+    @bot.tree.command(name="view", description="Toggle what shows and auto accept.")
+    async def view_cmd(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await bot.do_view(interaction.channel)
+        await interaction.followup.send("Posted the view settings here.", ephemeral=True)
+
     @bot.tree.command(name="interrupt", description="Interrupt the running turn.")
     async def interrupt(interaction: discord.Interaction) -> None:
         msg = await bot.do_interrupt(interaction.channel)
@@ -460,6 +497,10 @@ def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="mode")
     async def mode_cmd(ctx: commands.Context, mode: str) -> None:
         await ctx.channel.send(await bot.do_mode(ctx.channel, mode))
+
+    @bot.command(name="view")
+    async def view_cmd(ctx: commands.Context) -> None:
+        await bot.do_view(ctx.channel)
 
     @bot.command(name="interrupt")
     async def interrupt_cmd(ctx: commands.Context) -> None:
