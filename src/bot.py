@@ -1,4 +1,4 @@
-"""Discord bot: slash + chat commands and message forwarding."""
+"""Discord bot: prefix commands and message forwarding."""
 
 from __future__ import annotations
 
