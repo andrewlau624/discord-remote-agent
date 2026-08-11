@@ -29,6 +29,7 @@ from src.providers.claude import ClaudeProvider
 from src.render import command_pages, history_embeds, repo_pages, session_pages
 from src.session import Session
 from src.store import Store
+from src.terminal import TerminalManager, ensure_terminal_channel
 
 log = logging.getLogger("src")
 
@@ -90,6 +91,7 @@ class RemoteAgentBot(commands.Bot):
         self._tasks: set[asyncio.Task] = set()
         self._prefs_path = str(Path(config.db_path).with_name("prefs.json"))
         self.prefs = DisplayPrefs.load(self._prefs_path)
+        self.terminal = TerminalManager()
 
     async def setup_hook(self) -> None:
         register_chat(self)
@@ -207,12 +209,15 @@ class RemoteAgentBot(commands.Bot):
         work_dir = self._resolve_cwd(cwd)
         if not os.path.isdir(work_dir):
             return f"`{work_dir}` is not a directory."
+        carried: list[str] = []
         if branch:
             # Reuses an existing checkout of that branch, or creates a
             # worktree under <repo>/.worktrees/ so the main checkout is
             # never disturbed. `repos` lists what already exists.
             try:
-                work_dir = await asyncio.to_thread(resolve_worktree, work_dir, branch)
+                work_dir, carried = await asyncio.to_thread(
+                    resolve_worktree, work_dir, branch
+                )
             except RuntimeError as exc:
                 return f"Could not prepare a worktree for `{branch}`: `{exc}`"
         session_id = str(uuid.uuid4())
@@ -247,6 +252,8 @@ class RemoteAgentBot(commands.Bot):
         started = f"Started a **{provider_name}** session in {thread.mention}."
         if mode != "default":
             started += f" Mode: **{mode}**."
+        if carried:
+            started += f" Carried {len(carried)} env file(s): {', '.join(f'`{c}`' for c in carried[:5])}."
         return started
 
     async def do_resume(
@@ -381,6 +388,35 @@ class RemoteAgentBot(commands.Bot):
         await provider.start()
         session.provider = provider
 
+    async def do_terminal(self, channel: discord.abc.GuildChannel) -> str:
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return "Run this in a server."
+        # Bind to the session's cwd when invoked in a session thread,
+        # otherwise to the configured base path.
+        cwd = None
+        session = self.sessions.get(channel.id)
+        if session is not None:
+            cwd = getattr(session.provider, "cwd", None)
+        else:
+            pin = self.store.get(channel.id)
+            if pin and pin.session_id:
+                cwd = claude_provider.session_cwd(pin.session_id)
+        if not cwd:
+            cwd = os.path.expanduser(self.config.default_cwd or self.config.launch_cwd)
+        try:
+            term = await ensure_terminal_channel(guild)
+        except discord.Forbidden:
+            return "I need Manage Channels to create the terminal channel."
+        except discord.HTTPException as exc:
+            return f"Could not create the terminal channel: `{exc}`"
+        self.terminal.bind(term.id, cwd)
+        try:
+            await term.send(f"📂 Terminal bound to `{cwd}`")
+        except discord.HTTPException:
+            pass
+        return f"{term.mention} is bound to `{cwd}`. Messages there run as shell commands."
+
     async def do_view(self, channel: discord.abc.Messageable) -> None:
         self._spawn(view_panel(self, channel, self.prefs, self._on_pref_change))
 
@@ -437,6 +473,7 @@ class RemoteAgentBot(commands.Bot):
             ("skill <name> [args]", "run a skill in this session thread"),
             ("mode <name>", "switch permission mode (default, acceptEdits, auto, plan, bypassPermissions)"),
             ("view", "toggle what shows (thinking, tool calls, tool results)"),
+            ("terminal", "bind #terminal to this session's folder; messages there run as shell commands"),
             ("provider <name>", "set provider for the next new"),
             ("interrupt", "stop the current turn"),
             ("stop", "end this session and archive its thread"),
@@ -460,6 +497,9 @@ class RemoteAgentBot(commands.Bot):
             await self.process_commands(message)
             return
         if not content.strip():
+            return
+        if self.terminal.handles(message.channel.id):
+            self._spawn(self.terminal.run(message.channel, content))
             return
         session = self.sessions.get(message.channel.id)
         if session is None:
@@ -490,6 +530,10 @@ def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="repos")
     async def repos_cmd(ctx: commands.Context) -> None:
         await bot.do_repos(ctx.channel)
+
+    @bot.command(name="terminal")
+    async def terminal_cmd(ctx: commands.Context) -> None:
+        await ctx.channel.send(await bot.do_terminal(ctx.channel))
 
     @bot.command(name="resume")
     async def resume_cmd(
