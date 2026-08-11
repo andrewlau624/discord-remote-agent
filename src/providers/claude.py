@@ -138,9 +138,25 @@ def _stringify_tool_result(content: Any) -> str:
     return "\n".join(parts)
 
 
+def _format_ask_question(tool_input: dict[str, Any]) -> str:
+    lines: list[str] = []
+    for q in tool_input.get("questions") or []:
+        header = str(q.get("header", "")).strip()
+        question = str(q.get("question", "")).strip()
+        lines.append(f"{header}: {question}" if header else question)
+        for opt in q.get("options") or []:
+            label = str(opt.get("label", "")).strip()
+            desc = " ".join(str(opt.get("description", "")).split())
+            lines.append(f"  - {label}: {desc}" if desc else f"  - {label}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _format_tool_input(name: str, tool_input: dict[str, Any]) -> str:
     if name == "Bash":
         return str(tool_input.get("command", ""))
+    if name == "AskUserQuestion":
+        return _format_ask_question(tool_input)
     if name in ("Write", "Edit", "Read", "NotebookEdit"):
         path = tool_input.get("file_path", "")
         extra = ""

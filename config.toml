@@ -18,4 +18,4 @@ skills = "all"
 
 [tools]
 # Tools that run without asking. Anything else pops an approval poll.
-auto_approve = ["Read", "Glob", "Grep", "NotebookRead", "TodoWrite"]
+auto_approve = ["Read", "Glob", "Grep", "NotebookRead", "TodoWrite", "Bash"]

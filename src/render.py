@@ -15,6 +15,7 @@ import discord
 from src.providers.base import Block, BlockKind
 
 _CHUNK = 3800  # leave room for code fences under the 4096 limit
+_CONTENT_LIMIT = 2000  # Discord message content cap
 _MAX_EMBEDS = 6  # beyond this, attach the rest as a file
 
 _STYLE = {
@@ -30,7 +31,26 @@ _CODE_TOOLS = {"Bash"}
 
 
 def _fence(text: str, lang: str = "") -> str:
-    return f"```{lang}\n{text}\n```"
+    # Break up any triple backticks so they can't close the fence early.
+    safe = text.replace("```", "`​`​`")
+    return f"```{lang}\n{safe}\n```"
+
+
+def _question_md(tool_input: dict) -> str:
+    """Render an AskUserQuestion input as readable markdown instead of raw JSON."""
+    out: list[str] = []
+    for q in tool_input.get("questions") or []:
+        header = str(q.get("header", "")).strip()
+        question = str(q.get("question", "")).strip()
+        out.append(f"**{header}**  {question}" if header else f"**{question}**")
+        for opt in q.get("options") or []:
+            label = str(opt.get("label", "")).strip()
+            desc = " ".join(str(opt.get("description", "")).split())
+            out.append(f"• **{label}**: {desc}" if desc else f"• **{label}**")
+        if q.get("multiSelect"):
+            out.append("_pick any_")
+        out.append("")
+    return "\n".join(out).strip()
 
 
 def _chunks(text: str, size: int) -> list[str]:
@@ -39,7 +59,19 @@ def _chunks(text: str, size: int) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 
-def render_block(block: Block) -> tuple[list[discord.Embed], list[discord.File]]:
+def render_block(block: Block) -> list[dict]:
+    """Return a list of `channel.send(**kwargs)` dicts for one block.
+
+    Assistant text goes out as plain messages so it reads at normal chat size
+    with markdown intact. Other kinds render as colored embeds, and a very long
+    body is attached as a file so nothing is lost.
+    """
+    if block.kind == BlockKind.TEXT:
+        body = (block.body or "").strip()
+        if not body:
+            return []
+        return [{"content": part} for part in _chunks(body, _CONTENT_LIMIT)]
+
     default_title, color = _STYLE[block.kind]
     if block.kind == BlockKind.TOOL_RESULT and block.is_error:
         color = _STYLE[BlockKind.ERROR][1]
@@ -73,7 +105,13 @@ def render_block(block: Block) -> tuple[list[discord.Embed], list[discord.File]]
     if truncated and embeds:
         embeds[-1].set_footer(text="output truncated, full content attached")
 
-    return embeds, files
+    msgs: list[dict] = [{"embed": e} for e in embeds]
+    if files:
+        if msgs:
+            msgs[-1]["files"] = files
+        else:
+            msgs.append({"files": files})
+    return msgs
 
 
 _HISTORY_COLOR = 0x4E5058
@@ -112,6 +150,8 @@ def history_embeds(history: list[tuple[str, str]]) -> list[discord.Embed]:
 def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
     if tool_name == "Bash":
         body = _fence(str(tool_input.get("command", "")), "bash")
+    elif tool_name == "AskUserQuestion":
+        body = _question_md(tool_input) or "(no questions)"
     elif tool_name in ("Write", "Edit", "NotebookEdit"):
         path = tool_input.get("file_path", "")
         body = f"**{path}**"

@@ -51,12 +51,8 @@ class Session:
                     async for block in self.provider.run_turn(text):
                         if prefs is not None and not prefs.shows(block.kind):
                             continue
-                        embeds, files = render_block(block)
-                        for embed in embeds:
-                            await channel.send(embed=embed, files=files)
-                            files = []
-                        for extra in files:
-                            await channel.send(file=extra)
+                        for msg in render_block(block):
+                            await channel.send(**msg)
             except Exception as exc:
                 await channel.send(f"⚠️ Session error: `{type(exc).__name__}: {exc}`")
 
