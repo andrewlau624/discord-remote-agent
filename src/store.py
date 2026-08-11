@@ -19,6 +19,7 @@ class Pin:
     session_id: str | None
     created_at: float
     updated_at: float
+    mode: str = "default"
 
 
 _SCHEMA = """
@@ -27,7 +28,8 @@ CREATE TABLE IF NOT EXISTS pins (
     provider   TEXT    NOT NULL,
     session_id TEXT,
     created_at REAL    NOT NULL,
-    updated_at REAL    NOT NULL
+    updated_at REAL    NOT NULL,
+    mode       TEXT    NOT NULL DEFAULT 'default'
 );
 """
 
@@ -37,7 +39,16 @@ class Store:
         self._conn = sqlite3.connect(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the table already existed on disk."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pins)")}
+        if "mode" not in cols:
+            self._conn.execute(
+                "ALTER TABLE pins ADD COLUMN mode TEXT NOT NULL DEFAULT 'default'"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -50,6 +61,7 @@ class Store:
             session_id=r["session_id"],
             created_at=r["created_at"],
             updated_at=r["updated_at"],
+            mode=r["mode"],
         )
 
     def pin(self, channel_id: int, provider: str, session_id: str | None) -> None:
@@ -64,6 +76,13 @@ class Store:
                 updated_at = excluded.updated_at
             """,
             (channel_id, provider, session_id, now, now),
+        )
+        self._conn.commit()
+
+    def set_mode(self, channel_id: int, mode: str) -> None:
+        self._conn.execute(
+            "UPDATE pins SET mode = ?, updated_at = ? WHERE channel_id = ?",
+            (mode, time.time(), channel_id),
         )
         self._conn.commit()
 

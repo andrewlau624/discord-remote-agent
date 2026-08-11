@@ -86,12 +86,13 @@ def _build_options(
     skills: Any,
     model: str | None,
     can_use_tool: Any = None,
+    permission_mode: str = "default",
 ) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         cwd=cwd,
         resume=resume,
         session_id=session_id,
-        permission_mode="default",
+        permission_mode=permission_mode,
         allowed_tools=allowed_tools,
         can_use_tool=can_use_tool,
         model=model,
@@ -181,6 +182,7 @@ class ClaudeProvider(Provider):
         model: str | None = None,
         resume: str | None = None,
         session_id: str | None = None,
+        permission_mode: str = "default",
     ) -> None:
         self.cwd = cwd
         self.channel_id = channel_id
@@ -191,6 +193,7 @@ class ClaudeProvider(Provider):
         self._resume = resume
         self._new_session_id = session_id
         self.session_id = resume or session_id
+        self.permission_mode = permission_mode
         self._client: ClaudeSDKClient | None = None
 
     async def _can_use_tool(self, tool_name, tool_input, context):  # noqa: ANN001
@@ -199,6 +202,10 @@ class ClaudeProvider(Provider):
         if tool_name == "AskUserQuestion":
             answer = await self.broker.ask(self.channel_id, tool_input)
             return PermissionResultDeny(message=answer)
+        # Auto accept: approve without polling. Questions above still reach
+        # the user; only tool approvals are skipped.
+        if getattr(self.broker, "auto_accept", False):
+            return PermissionResultAllow()
         allowed, reason = await self.broker.request(
             self.channel_id, tool_name, tool_input
         )
@@ -215,6 +222,7 @@ class ClaudeProvider(Provider):
             skills=self.skills,
             model=self.model,
             can_use_tool=self._can_use_tool,
+            permission_mode=self.permission_mode,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -233,6 +241,7 @@ class ClaudeProvider(Provider):
     async def set_mode(self, mode: str) -> None:
         if self._client is not None:
             await self._client.set_permission_mode(mode)
+        self.permission_mode = mode
 
     async def run_turn(self, text: str) -> AsyncIterator[Block]:
         if self._client is None:
