@@ -8,6 +8,7 @@ the repo, branch, working directory, and session id.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 
 import discord
@@ -57,13 +58,14 @@ def list_worktrees(repo_dir: str) -> list[tuple[str, str]]:
     return entries
 
 
-def resolve_worktree(repo_dir: str, branch: str) -> str:
+def resolve_worktree(repo_dir: str, branch: str) -> tuple[str, list[str]]:
     """Worktree path for a branch: reuse an existing checkout, otherwise
     create <repo>/.worktrees/<branch>. The branch is created if it does not
-    exist. Raises RuntimeError with git's message on failure."""
+    exist. Gitignored .env* files are carried over from the main checkout.
+    Returns (path, copied env files). Raises RuntimeError on failure."""
     for path, wt_branch in list_worktrees(repo_dir):
         if wt_branch == branch:
-            return path
+            return path, _copy_envs(repo_dir, path)
     path = os.path.join(repo_dir, ".worktrees", branch.replace("/", "-"))
     _ensure_excluded(repo_dir, ".worktrees/")
     try:
@@ -74,7 +76,43 @@ def resolve_worktree(repo_dir: str, branch: str) -> str:
             raise RuntimeError(out.stderr.strip().splitlines()[-1] if out.stderr.strip() else "git worktree add failed")
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(str(exc)) from exc
-    return path
+    return path, _copy_envs(repo_dir, path)
+
+
+def _copy_envs(repo_dir: str, worktree_dir: str) -> list[str]:
+    """Copy gitignored .env* files from the main checkout into a worktree.
+
+    Worktrees start clean, so local-only env files do not come along on their
+    own. Existing files in the worktree are never overwritten. Returns the
+    repo-relative paths copied."""
+    if os.path.realpath(worktree_dir) == os.path.realpath(repo_dir):
+        return []
+    try:
+        out = _run_git(
+            repo_dir, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    copied: list[str] = []
+    for rel in out.stdout.splitlines():
+        rel = rel.strip()
+        # Ignored directories are collapsed to one "dir/" entry, which skips
+        # things like node_modules without walking them.
+        if not rel or rel.endswith("/"):
+            continue
+        if not os.path.basename(rel).startswith(".env"):
+            continue
+        src = os.path.join(repo_dir, rel)
+        dst = os.path.join(worktree_dir, rel)
+        if not os.path.isfile(src) or os.path.exists(dst):
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError:
+            continue
+        copied.append(rel)
+    return copied
 
 
 def _ensure_excluded(repo_dir: str, pattern: str) -> None:
