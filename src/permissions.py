@@ -17,6 +17,7 @@ from src.render import permission_embed
 
 _APPROVE = "✅"
 _DENY = "🛑"
+_SUBMIT = "🆗"  # finalizes a multi-select answer poll
 
 
 class DiscordPermissionBroker:
@@ -44,6 +45,141 @@ class DiscordPermissionBroker:
             return await self._ask_poll(channel, tool_name, owner_id)
         except (discord.HTTPException, TypeError):
             return await self._ask_reactions(channel, tool_name, owner_id)
+
+    # ---- structured questions (AskUserQuestion) --------------------------
+
+    async def ask(self, channel_id: int, tool_input: dict[str, Any]) -> str:
+        """Turn an AskUserQuestion into one poll per question and feed the
+        owner's picks back to the agent as text."""
+        channel = self._bot.get_channel(channel_id)
+        if channel is None or not isinstance(channel, discord.abc.Messageable):
+            return "No channel available to ask the question."
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return "Questions only work in a server."
+        owner_id = guild.owner_id
+
+        questions = tool_input.get("questions") or []
+        if not questions:
+            return "No question to answer. Continue with your best judgment."
+
+        # Show the full text with option descriptions; polls only carry labels.
+        await channel.send(embed=permission_embed("AskUserQuestion", tool_input))
+
+        parts: list[str] = []
+        for q in questions:
+            header = str(q.get("header") or q.get("question") or "Answer").strip()
+            try:
+                picks = await self._answer_poll(channel, owner_id, q)
+            except (discord.HTTPException, TypeError):
+                picks = []
+            parts.append(f"{header}: {', '.join(picks)}" if picks else f"{header}: (no answer)")
+
+        return (
+            "The user answered your question(s):\n"
+            + "\n".join(parts)
+            + "\nProceed with these selections and do not ask again."
+        )
+
+    async def _answer_poll(
+        self, channel: discord.abc.Messageable, owner_id: int, question: dict[str, Any]
+    ) -> list[str]:
+        options = question.get("options") or []
+        labels = [str(o.get("label", "?"))[:55] or "?" for o in options][:10]
+        if not labels:
+            return []
+        multiple = bool(question.get("multiSelect"))
+        q_text = str(question.get("header") or question.get("question") or "Choose")[:300]
+
+        poll = discord.Poll(question=q_text, duration=timedelta(hours=1), multiple=multiple)
+        for label in labels:
+            poll.add_answer(text=label)
+        message = await channel.send(poll=poll)
+        id_to_label = {i + 1: labels[i] for i in range(len(labels))}
+
+        if multiple:
+            try:
+                await message.add_reaction(_SUBMIT)
+            except discord.HTTPException:
+                pass
+            selected = await self._collect_multi(message, owner_id)
+        else:
+            selected = await self._collect_single(message, owner_id)
+
+        try:
+            await message.end_poll()
+        except discord.HTTPException:
+            pass
+        return [id_to_label[a] for a in sorted(selected) if a in id_to_label]
+
+    async def _collect_single(self, message: discord.Message, owner_id: int) -> set[int]:
+        def check(payload: discord.RawPollVoteActionEvent) -> bool:
+            return payload.message_id == message.id and payload.user_id == owner_id
+
+        try:
+            payload = await self._bot.wait_for(
+                "raw_poll_vote_add", check=check, timeout=self._timeout
+            )
+            return {payload.answer_id}
+        except asyncio.TimeoutError:
+            return set()
+
+    async def _collect_multi(self, message: discord.Message, owner_id: int) -> set[int]:
+        """Track the owner's ticks and finalize when they react 🆗 or time out."""
+        selected: set[int] = set()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._timeout
+
+        def vote_check(payload: discord.RawPollVoteActionEvent) -> bool:
+            return payload.message_id == message.id and payload.user_id == owner_id
+
+        def submit_check(payload: discord.RawReactionActionEvent) -> bool:
+            return (
+                payload.message_id == message.id
+                and payload.user_id == owner_id
+                and str(payload.emoji) == _SUBMIT
+            )
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            waiters = {
+                asyncio.ensure_future(
+                    self._bot.wait_for("raw_poll_vote_add", check=vote_check, timeout=remaining)
+                ): "add",
+                asyncio.ensure_future(
+                    self._bot.wait_for("raw_poll_vote_remove", check=vote_check, timeout=remaining)
+                ): "remove",
+                asyncio.ensure_future(
+                    self._bot.wait_for("raw_reaction_add", check=submit_check, timeout=remaining)
+                ): "submit",
+            }
+            done, pending = await asyncio.wait(
+                waiters.keys(), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            finalize = False
+            progressed = False
+            for task in done:
+                kind = waiters[task]
+                try:
+                    result = task.result()
+                except (asyncio.TimeoutError, Exception):
+                    continue
+                progressed = True
+                if kind == "submit":
+                    finalize = True
+                elif kind == "add":
+                    selected.add(result.answer_id)
+                elif kind == "remove":
+                    selected.discard(result.answer_id)
+            if finalize or not progressed:
+                break
+        return selected
 
     async def _ask_poll(
         self, channel: discord.abc.Messageable, tool_name: str, owner_id: int

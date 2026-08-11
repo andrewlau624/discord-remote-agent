@@ -194,6 +194,11 @@ class ClaudeProvider(Provider):
         self._client: ClaudeSDKClient | None = None
 
     async def _can_use_tool(self, tool_name, tool_input, context):  # noqa: ANN001
+        # AskUserQuestion is not an approval; poll the user and feed the answer
+        # back through the deny message, which the model reads as the result.
+        if tool_name == "AskUserQuestion":
+            answer = await self.broker.ask(self.channel_id, tool_input)
+            return PermissionResultDeny(message=answer)
         allowed, reason = await self.broker.request(
             self.channel_id, tool_name, tool_input
         )

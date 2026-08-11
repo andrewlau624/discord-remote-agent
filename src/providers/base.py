@@ -46,6 +46,10 @@ class PermissionBroker(Protocol):
         """Return (allowed, deny_reason). deny_reason is shown to the agent."""
         ...
 
+    async def ask(self, channel_id: int, tool_input: dict[str, Any]) -> str:
+        """Poll the user for a structured answer; return it as feedback text."""
+        ...
+
 
 class Provider(ABC):
     """A live agent session bound to one working directory."""

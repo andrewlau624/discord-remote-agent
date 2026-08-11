@@ -18,6 +18,10 @@ Gemini, and opencode can slot in behind the same interface later.
 - Run as many sessions as you want, each in its own thread.
 - Read-only tools run on their own. Bash, Write, Edit, and anything else not in
   the allowlist post an Approve/Deny poll first.
+- When the agent asks you something (AskUserQuestion), it shows up as a real
+  poll with its options. Your pick is sent back to the agent as the answer.
+  Multi-select questions add a 🆗 reaction you tap to submit. Auto accept skips
+  these, so leave it off if you want to be asked.
 - `/stop` ends a session and archives its thread. Threads survive restarts, so
   sending a message in one resumes its session, or use `/resume <id>`.
 - Resuming into a fresh thread replays the prior conversation (the text you and
