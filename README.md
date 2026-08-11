@@ -40,8 +40,8 @@ so there is no default path to configure.
 3. Make a Discord app and bot at https://discord.com/developers/applications.
    Under Bot, turn on the Message Content Intent. Invite it with the
    `applications.commands` and `bot` scopes, and give it Manage Channels (to
-   create the sessions forum), plus Send Messages, Create Posts, and Send
-   Messages in Threads.
+   create the sessions forum), Manage Messages (to clear page reactions), plus
+   Send Messages, Create Posts, and Send Messages in Threads.
 4. Copy the env file and fill it in:
 
    ```
@@ -77,6 +77,7 @@ Every command works as `/name` or `<prefix>name` (default `!name`).
 - `provider <name>` pick the provider for the next `new`
 - `skills` list available skills and commands (paged)
 - `skill <name> [args]` run a skill in this session
+- `mode <name>` switch permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions`
 - `interrupt` stop the current turn
 - `stop` end this session and archive its thread
 - `help` list commands (chat command only)

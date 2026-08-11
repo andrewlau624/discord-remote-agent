@@ -99,40 +99,43 @@ def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
     return embed
 
 
-def _line_pages(lines: list[str], title: str, per_page: int = 12) -> list[discord.Embed]:
-    if not lines:
+def _field_pages(
+    items: list[tuple[str, str]], title: str, per_page: int = 8
+) -> list[discord.Embed]:
+    """One field per item so entries render with clear separation."""
+    if not items:
         return [discord.Embed(title=title, description="Nothing to show.", color=0x5865F2)]
     pages: list[discord.Embed] = []
-    for i in range(0, len(lines), per_page):
-        chunk = "\n".join(lines[i : i + per_page])[:4096]
-        embed = discord.Embed(title=title, description=chunk, color=0x5865F2)
+    for i in range(0, len(items), per_page):
+        embed = discord.Embed(title=title, color=0x5865F2)
+        for name, value in items[i : i + per_page]:
+            embed.add_field(name=name[:256], value=(value or "​")[:1024], inline=False)
         pages.append(embed)
     return pages
 
 
 def command_pages(commands: list[dict]) -> list[discord.Embed]:
     """Paginated skill/command list."""
-    lines: list[str] = []
+    items: list[tuple[str, str]] = []
     for cmd in sorted(commands, key=lambda c: str(c.get("name", ""))):
         name = str(cmd.get("name", "")).strip()
         if not name:
             continue
         desc = " ".join(str(cmd.get("description", "")).split())
-        if len(desc) > 90:
-            desc = desc[:87] + "..."
-        lines.append(f"`/{name}` {desc}".rstrip())
-    return _line_pages(lines, f"Skills ({len(lines)})")
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
+        items.append((f"/{name}", desc or "​"))
+    return _field_pages(items, f"Skills ({len(items)})")
 
 
 def session_pages(sessions: list, pinned: dict[str, int]) -> list[discord.Embed]:
     """Paginated resumable sessions. `pinned` maps session_id -> channel_id."""
-    lines: list[str] = []
+    items: list[tuple[str, str]] = []
     for s in sessions:
         sid = getattr(s, "session_id", "")
-        title = getattr(s, "custom_title", None) or getattr(s, "summary", None) or ""
-        title = " ".join(str(title).split())[:60]
+        title = getattr(s, "custom_title", None) or getattr(s, "summary", None) or "untitled"
+        title = " ".join(str(title).split())[:80]
         cwd = getattr(s, "cwd", "") or ""
         mark = "📌" if sid in pinned else "▫️"
-        sep = " · " if title and cwd else ""
-        lines.append(f"{mark} `{sid}`\n{title}{sep}{cwd}")
-    return _line_pages(lines, f"Resumable sessions ({len(lines)})", per_page=8)
+        items.append((f"{mark} {title}", f"`{sid}`\n{cwd}"))
+    return _field_pages(items, f"Resumable sessions ({len(items)})")

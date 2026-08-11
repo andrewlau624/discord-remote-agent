@@ -70,6 +70,10 @@ class Provider(ABC):
         """The session's title once the agent has named it, else None."""
 
     @abstractmethod
+    async def set_mode(self, mode: str) -> None:
+        """Switch the agent's permission mode for this session."""
+
+    @abstractmethod
     async def interrupt(self) -> None:
         """Interrupt the in-flight turn, if any."""
 

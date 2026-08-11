@@ -47,19 +47,21 @@ async def paginate(
         )
 
     while True:
-        done, _ = await asyncio.wait(
-            [
-                asyncio.create_task(bot.wait_for("raw_reaction_add", check=check)),
-                asyncio.create_task(bot.wait_for("raw_reaction_remove", check=check)),
-            ],
-            timeout=_IDLE_TIMEOUT,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if not done:
+        try:
+            payload = await bot.wait_for(
+                "raw_reaction_add", check=check, timeout=_IDLE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
             break
-        payload = done.pop().result()
-        for task in _:  # cancel the pending waiter
-            task.cancel()
 
         idx = (idx + 1) % total if str(payload.emoji) == _NEXT else (idx - 1) % total
         await message.edit(embed=stamp(idx))
+
+        # Clear the click right away so the next tap registers.
+        member = payload.member or (guild.get_member(payload.user_id) if guild else None)
+        if member is not None:
+            try:
+                await message.remove_reaction(payload.emoji, member)
+            except discord.HTTPException:
+                pass
+

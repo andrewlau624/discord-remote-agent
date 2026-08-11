@@ -91,11 +91,16 @@ class DiscordPermissionBroker:
             )
 
         try:
-            reaction, _user = await self._bot.wait_for(
+            reaction, user = await self._bot.wait_for(
                 "reaction_add", check=check, timeout=self._timeout
             )
         except asyncio.TimeoutError:
             return False, "Approval timed out."
+
+        try:
+            await message.remove_reaction(reaction.emoji, user)
+        except discord.HTTPException:
+            pass
 
         return (str(reaction.emoji) == _APPROVE), (
             None if str(reaction.emoji) == _APPROVE else "Denied by user."

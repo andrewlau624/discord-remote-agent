@@ -183,6 +183,10 @@ class ClaudeProvider(Provider):
             return None
         return session_title(self.session_id)
 
+    async def set_mode(self, mode: str) -> None:
+        if self._client is not None:
+            await self._client.set_permission_mode(mode)
+
     async def run_turn(self, text: str) -> AsyncIterator[Block]:
         if self._client is None:
             raise RuntimeError("Provider not started")

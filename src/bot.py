@@ -26,6 +26,16 @@ log = logging.getLogger("src")
 
 SUPPORTED_PROVIDERS = ("claude",)
 
+# Permission modes exposed as choices, plus friendly aliases.
+MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
+MODE_ALIASES = {
+    "auto": "acceptEdits",
+    "edit": "acceptEdits",
+    "edits": "acceptEdits",
+    "accept": "acceptEdits",
+    "bypass": "bypassPermissions",
+}
+
 
 class RemoteAgentBot(commands.Bot):
     def __init__(self, config: Config) -> None:
@@ -232,6 +242,19 @@ class RemoteAgentBot(commands.Bot):
         self.pending_provider[guild.id] = name
         return f"Provider set to **{name}** for the next new session."
 
+    async def do_mode(self, channel: discord.abc.GuildChannel, mode: str) -> str:
+        mode = MODE_ALIASES.get(mode.lower(), mode)
+        if mode not in ("default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"):
+            return f"Unknown mode. Options: {', '.join(MODES)}."
+        session = self.sessions.get(channel.id) or await self._resume_pin(channel.id)
+        if session is None:
+            return "No session here. Run this in a session thread."
+        try:
+            await session.provider.set_mode(mode)
+        except Exception as exc:
+            return f"Could not switch mode: `{exc}`"
+        return f"Mode set to **{mode}**."
+
     async def do_skill(
         self, channel: discord.abc.GuildChannel, name: str, args: str | None
     ) -> str:
@@ -266,6 +289,7 @@ class RemoteAgentBot(commands.Bot):
             ("list", "show resumable sessions"),
             ("skills", "list available skills"),
             ("skill <name> [args]", "run a skill in this session thread"),
+            ("mode <name>", "switch permission mode (default, acceptEdits, plan, bypassPermissions)"),
             ("provider <name>", "set provider for the next new"),
             ("interrupt", "stop the current turn"),
             ("stop", "end this session and archive its thread"),
@@ -351,6 +375,14 @@ def register_slash(bot: RemoteAgentBot) -> None:
         msg = await bot.do_provider(interaction.guild, name.value)
         await interaction.response.send_message(msg, ephemeral=True)
 
+    @bot.tree.command(name="mode", description="Switch this session's permission mode.")
+    @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in MODES])
+    async def mode_cmd(
+        interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        msg = await bot.do_mode(interaction.channel, mode.value)
+        await interaction.response.send_message(msg, ephemeral=True)
+
     @bot.tree.command(name="interrupt", description="Interrupt the running turn.")
     async def interrupt(interaction: discord.Interaction) -> None:
         msg = await bot.do_interrupt(interaction.channel)
@@ -394,6 +426,10 @@ def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="provider")
     async def provider_cmd(ctx: commands.Context, name: str) -> None:
         await ctx.channel.send(await bot.do_provider(ctx.guild, name))
+
+    @bot.command(name="mode")
+    async def mode_cmd(ctx: commands.Context, mode: str) -> None:
+        await ctx.channel.send(await bot.do_mode(ctx.channel, mode))
 
     @bot.command(name="interrupt")
     async def interrupt_cmd(ctx: commands.Context) -> None:
