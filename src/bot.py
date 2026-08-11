@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 from src.config import Config
@@ -58,15 +57,7 @@ class RemoteAgentBot(commands.Bot):
         self.prefs = DisplayPrefs.load(self._prefs_path)
 
     async def setup_hook(self) -> None:
-        self.tree.interaction_check = self._owner_check  # type: ignore[assignment]
-        register_slash(self)
         register_chat(self)
-        if self.config.guild_id:
-            guild = discord.Object(id=self.config.guild_id)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, getattr(self.user, "id", "?"))
@@ -76,17 +67,6 @@ class RemoteAgentBot(commands.Bot):
     @staticmethod
     def _is_server_owner(user_id: int, guild: discord.Guild | None) -> bool:
         return guild is not None and guild.owner_id == user_id
-
-    async def _owner_check(self, interaction: discord.Interaction) -> bool:
-        if self._is_server_owner(interaction.user.id, interaction.guild):
-            return True
-        try:
-            await interaction.response.send_message(
-                "Only the server owner can use this bot.", ephemeral=True
-            )
-        except discord.HTTPException:
-            pass
-        return False
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -355,7 +335,7 @@ class RemoteAgentBot(commands.Bot):
             ("interrupt", "stop the current turn"),
             ("stop", "end this session and archive its thread"),
         ]
-        lines = [f"Commands (use `/` or `{p}`):"]
+        lines = [f"Commands (prefix `{p}`):"]
         lines += [f"`{p}{cmd}` {desc}" for cmd, desc in rows]
         return "\n".join(lines)
 
@@ -382,84 +362,6 @@ class RemoteAgentBot(commands.Bot):
         if session is None:
             return
         await session.handle_message(content)
-
-
-# ---------------------------------------------------------------------------
-# Slash commands
-# ---------------------------------------------------------------------------
-
-
-def register_slash(bot: RemoteAgentBot) -> None:
-    @bot.tree.command(name="new", description="Start a session pinned to this channel.")
-    @app_commands.describe(cwd="Repo name under the base path, or a full path")
-    async def new(interaction: discord.Interaction, cwd: str | None = None) -> None:
-        await interaction.response.defer(ephemeral=True)
-        msg = await bot.do_new(interaction.guild, cwd)
-        await interaction.followup.send(msg, ephemeral=True)
-
-    @bot.tree.command(name="resume", description="Resume a session in a new thread.")
-    @app_commands.describe(session_id="Agent session id", cwd="Override working directory")
-    async def resume(
-        interaction: discord.Interaction, session_id: str, cwd: str | None = None
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        msg = await bot.do_resume(interaction.guild, session_id, cwd)
-        await interaction.followup.send(msg, ephemeral=True)
-
-    @bot.tree.command(name="list", description="Show resumable sessions.")
-    async def list_cmd(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        await bot.do_list(interaction.channel)
-        await interaction.followup.send("Posted the list here.", ephemeral=True)
-
-    @bot.tree.command(name="skills", description="List available skills / commands.")
-    async def skills(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        await bot.do_skills(interaction.channel)
-        await interaction.followup.send("Posted the skills here.", ephemeral=True)
-
-    @bot.tree.command(name="skill", description="Run a skill / command in this session.")
-    @app_commands.describe(name="Skill name (see /skills)", args="Optional arguments")
-    async def skill(
-        interaction: discord.Interaction, name: str, args: str | None = None
-    ) -> None:
-        msg = await bot.do_skill(interaction.channel, name, args)
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @bot.tree.command(name="provider", description="Set the provider for the next /new.")
-    @app_commands.choices(
-        name=[app_commands.Choice(name=p, value=p) for p in SUPPORTED_PROVIDERS]
-    )
-    async def provider_cmd(
-        interaction: discord.Interaction, name: app_commands.Choice[str]
-    ) -> None:
-        msg = await bot.do_provider(interaction.guild, name.value)
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @bot.tree.command(name="mode", description="Switch this session's permission mode.")
-    @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in MODES])
-    async def mode_cmd(
-        interaction: discord.Interaction, mode: app_commands.Choice[str]
-    ) -> None:
-        msg = await bot.do_mode(interaction.channel, mode.value)
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @bot.tree.command(name="view", description="Toggle what shows and auto accept.")
-    async def view_cmd(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        await bot.do_view(interaction.channel)
-        await interaction.followup.send("Posted the view settings here.", ephemeral=True)
-
-    @bot.tree.command(name="interrupt", description="Interrupt the running turn.")
-    async def interrupt(interaction: discord.Interaction) -> None:
-        msg = await bot.do_interrupt(interaction.channel)
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @bot.tree.command(name="stop", description="Stop this channel's session and free it.")
-    async def stop(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        msg = await bot.do_stop(interaction.channel)
-        await interaction.followup.send(msg, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------

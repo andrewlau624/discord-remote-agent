@@ -32,7 +32,6 @@ def _read_toml(path: str) -> dict:
 @dataclass(frozen=True)
 class Config:
     token: str
-    guild_id: int | None
     launch_cwd: str
     prefix: str = "!"
     default_cwd: str = ""
@@ -52,9 +51,6 @@ class Config:
                 "DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in."
             )
 
-        guild_raw = os.environ.get("GUILD_ID", "").strip()
-        guild_id = int(guild_raw) if guild_raw else None
-
         toml = _read_toml(toml_path)
         bot = toml.get("bot", {})
         tools = toml.get("tools", {})
@@ -71,7 +67,6 @@ class Config:
 
         return cls(
             token=token,
-            guild_id=guild_id,
             launch_cwd=os.getcwd(),
             prefix=str(bot.get("prefix", "!")) or "!",
             default_cwd=str(bot.get("default_cwd", "")).strip(),

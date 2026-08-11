@@ -1,35 +1,32 @@
 # discord-remote-agent
 
-Control CLI coding agents from Discord. Run it on your machine and a dedicated
-server becomes the interface. Each session is a forum post, agent output shows up
-as blocks (thinking, tool calls, tool results, text), and tool calls that can
-change things wait for you to vote Approve or Deny in a poll.
+Drive CLI coding agents from Discord. Run it on your machine and a private
+server becomes the interface. Each session is a forum post, the agent's output
+shows up as blocks (thinking, tool calls, tool results, text), and anything that
+could change your files waits for you to vote Approve or Deny.
 
 Claude Code is the first provider. The provider layer is pluggable, so Codex,
 Gemini, and opencode can slot in behind the same interface later.
 
 ## How it works
 
-- Sessions live in a forum channel called `sessions`, created the first time you
-  need it. Each session is its own forum post (thread). The post is named after
-  the Claude session and holds the repo, branch, working directory, and id.
-- `/new` and `/resume` work from anywhere and open (or reopen) a thread. Type in
-  that thread to talk to the agent.
-- Run as many sessions as you want, each in its own thread.
-- Read-only tools run on their own. Bash, Write, Edit, and anything else not in
+- Sessions live in a forum channel called `sessions`, made the first time it is
+  needed. Each session is its own post (thread), named after the Claude session,
+  holding the repo, branch, working directory, and id.
+- `!new` and `!resume` work from anywhere and open a thread. Type in that thread
+  to talk to the agent. Run as many sessions as you want, each in its own thread.
+- Read-only tools run on their own. Bash, Write, Edit, and anything else not on
   the allowlist post an Approve/Deny poll first.
-- When the agent asks you something (AskUserQuestion), it shows up as a real
-  poll with its options. Your pick is sent back to the agent as the answer.
-  Multi-select questions add a 🆗 reaction you tap to submit. Auto accept skips
-  these, so leave it off if you want to be asked.
-- `/stop` ends a session and archives its thread. Threads survive restarts, so
-  sending a message in one resumes its session, or use `/resume <id>`.
-- Resuming into a fresh thread replays the prior conversation (the text you and
-  the agent exchanged, not tool calls) so you have the context.
-- Commands work as slash commands or as chat commands with a prefix you set in
-  config (default `!`), so `/list` and `!list` both work.
-- Long lists like `/list` and `/skills` page with ◀ ▶ reactions.
-- `/view` opens a panel where you react to toggle which blocks show (thinking,
+- When the agent asks you something, it shows up as a real poll with its options.
+  Your pick goes back to the agent as the answer. Multi-select questions add a 🆗
+  reaction you tap to submit. Auto accept skips these, so leave it off if you
+  want to be asked.
+- `!stop` ends a session and archives its thread. Threads survive restarts, so
+  posting in one resumes its session, or use `!resume <id>`.
+- Resuming into a fresh thread replays the prior conversation (the text, not the
+  tool calls) so you have the context.
+- Long lists like `!list` and `!skills` page with ◀ ▶ reactions.
+- `!view` opens a panel where you react to toggle which blocks show (thinking,
   tool calls, tool results) and to flip auto accept, which runs every tool
   without a poll. The choices persist across restarts.
 
@@ -47,18 +44,18 @@ so there is no default path to configure.
    ```
 
 3. Make a Discord app and bot at https://discord.com/developers/applications.
-   Under Bot, turn on the Message Content Intent. Invite it with the
-   `applications.commands` and `bot` scopes, and give it Manage Channels (to
-   create the sessions forum), Manage Messages (to clear page reactions), plus
-   Send Messages, Create Posts, and Send Messages in Threads.
-4. Copy the env file and fill it in:
+   Under Bot, turn on the Message Content Intent. Invite it with the `bot` scope
+   and give it Manage Channels (to create the sessions forum), Manage Messages
+   (to clear page reactions), plus Send Messages, Create Posts, and Send Messages
+   in Threads.
+4. Copy the env file and set your token:
 
    ```
    cp .env.example .env
    ```
 
-   Set `DISCORD_TOKEN` and `GUILD_ID` for your server. Only the server owner can
-   use the bot, so there is no allowlist to configure.
+   Set `DISCORD_TOKEN`. Only the server owner can use the bot, so there is no
+   allowlist to configure.
 5. Run it:
 
    ```
@@ -67,9 +64,9 @@ so there is no default path to configure.
 
 ## Config
 
-Secrets and identity live in `.env`. Everything else is in `config.toml`:
+Secrets live in `.env`. Everything else is in `config.toml`:
 
-- `prefix` for chat commands (default `!`)
+- `prefix` for commands (default `!`)
 - `model` for Claude Code (blank uses the default)
 - `default_cwd`, the base path for new sessions (blank uses the launch dir)
 - `approval_timeout` in seconds
@@ -79,19 +76,21 @@ Secrets and identity live in `.env`. Everything else is in `config.toml`:
 
 ## Commands
 
-Every command works as `/name` or `<prefix>name` (default `!name`).
+Type them in any channel with the prefix (default `!`).
 
-- `new [repo]` start a session, opens a thread (a repo name resolves under `default_cwd`, or pass a full path)
-- `resume <session_id> [cwd]` resume a session in a thread
-- `list` show resumable sessions (paged), 📌 marks open ones
-- `provider <name>` pick the provider for the next `new`
-- `skills` list available skills and commands (paged)
-- `skill <name> [args]` run a skill in this session
-- `mode <name>` switch permission mode: `default`, `acceptEdits`, `auto`, `plan`, `bypassPermissions`
-- `view` open a panel to toggle what shows (thinking, tool calls, tool results) and auto accept
-- `interrupt` stop the current turn
-- `stop` end this session and archive its thread
-- `help` list commands (chat command only)
+- `!new [repo]` start a session, opens a thread (a repo name resolves under
+  `default_cwd`, or pass a full path)
+- `!resume <session_id> [cwd]` resume a session in a thread
+- `!list` show resumable sessions (paged), 📌 marks open ones
+- `!provider <name>` pick the provider for the next `!new`
+- `!skills` list available skills and commands (paged)
+- `!skill <name> [args]` run a skill in this session
+- `!mode <name>` switch permission mode: `default`, `acceptEdits`, `auto`,
+  `plan`, `bypassPermissions`
+- `!view` open a panel to toggle what shows and auto accept
+- `!interrupt` stop the current turn
+- `!stop` end this session and archive its thread
+- `!help` list commands
 
 ## Security
 
