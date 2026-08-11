@@ -53,6 +53,25 @@ def _question_md(tool_input: dict) -> str:
     return "\n".join(out).strip()
 
 
+def ask_question_text(question: dict) -> str:
+    """One AskUserQuestion question as a big, readable message.
+
+    A markdown heading makes it easy to see, and the option descriptions ride
+    along here since the poll buttons only carry short labels.
+    """
+    header = str(question.get("header", "")).strip()
+    qtext = str(question.get("question", "")).strip()
+    lines: list[str] = [f"## {header or qtext or 'Question'}"]
+    if header and qtext:
+        lines.append(qtext)
+    for opt in question.get("options") or []:
+        label = str(opt.get("label", "")).strip()
+        desc = " ".join(str(opt.get("description", "")).split())
+        lines.append(f"• **{label}** {desc}" if desc else f"• **{label}**")
+    lines.append("• **Other** type your own answer")
+    return "\n".join(lines)[:2000]
+
+
 def _chunks(text: str, size: int) -> list[str]:
     if not text:
         return [""]

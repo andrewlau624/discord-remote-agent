@@ -13,17 +13,21 @@ from typing import Any
 
 import discord
 
-from src.render import permission_embed
+from src.render import ask_question_text, permission_embed
 
 _APPROVE = "✅"
 _DENY = "🛑"
 _SUBMIT = "🆗"  # finalizes a multi-select answer poll
+_OTHER = "Other"  # always-present poll choice that lets you type a free answer
 
 
 class DiscordPermissionBroker:
     def __init__(self, bot: discord.Client, timeout: int):
         self._bot = bot
         self._timeout = timeout
+        # Channels waiting for a typed "Other" answer. on_message skips
+        # forwarding a message here so it becomes the answer, not a new turn.
+        self.awaiting_text: set[int] = set()
 
     async def request(
         self,
@@ -63,9 +67,6 @@ class DiscordPermissionBroker:
         if not questions:
             return "No question to answer. Continue with your best judgment."
 
-        # Show the full text with option descriptions; polls only carry labels.
-        await channel.send(embed=permission_embed("AskUserQuestion", tool_input))
-
         parts: list[str] = []
         for q in questions:
             header = str(q.get("header") or q.get("question") or "Answer").strip()
@@ -85,12 +86,15 @@ class DiscordPermissionBroker:
         self, channel: discord.abc.Messageable, owner_id: int, question: dict[str, Any]
     ) -> list[str]:
         options = question.get("options") or []
-        labels = [str(o.get("label", "?"))[:55] or "?" for o in options][:10]
-        if not labels:
-            return []
+        # Leave a slot for the always-present "Other" choice.
+        labels = [str(o.get("label", "?"))[:55] or "?" for o in options][:9]
+        labels.append(_OTHER)
         multiple = bool(question.get("multiSelect"))
-        q_text = str(question.get("header") or question.get("question") or "Choose")[:300]
 
+        # Big, readable question with option descriptions, then the poll.
+        await channel.send(ask_question_text(question))
+
+        q_text = str(question.get("header") or question.get("question") or "Choose")[:300]
         poll = discord.Poll(question=q_text, duration=timedelta(hours=1), multiple=multiple)
         for label in labels:
             poll.add_answer(text=label)
@@ -110,7 +114,38 @@ class DiscordPermissionBroker:
             await message.end_poll()
         except discord.HTTPException:
             pass
-        return [id_to_label[a] for a in sorted(selected) if a in id_to_label]
+
+        picks = [id_to_label[a] for a in sorted(selected) if a in id_to_label]
+        if _OTHER in picks:
+            picks.remove(_OTHER)
+            typed = await self._collect_other_text(channel, owner_id)
+            if typed:
+                picks.append(typed)
+        return picks
+
+    async def _collect_other_text(
+        self, channel: discord.abc.Messageable, owner_id: int
+    ) -> str:
+        """Wait for the owner to type their own answer after picking Other."""
+        await channel.send("You picked **Other**. Type your answer here.")
+        self.awaiting_text.add(channel.id)
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.channel.id == channel.id
+                and message.author.id == owner_id
+                and bool(message.content.strip())
+            )
+
+        try:
+            message = await self._bot.wait_for(
+                "message", check=check, timeout=self._timeout
+            )
+            return message.content.strip()
+        except asyncio.TimeoutError:
+            return ""
+        finally:
+            self.awaiting_text.discard(channel.id)
 
     async def _collect_single(self, message: discord.Message, owner_id: int) -> set[int]:
         def check(payload: discord.RawPollVoteActionEvent) -> bool:
