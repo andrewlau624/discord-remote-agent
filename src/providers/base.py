@@ -66,6 +66,10 @@ class Provider(ABC):
         """Available skills/commands, as {name, description} dicts."""
 
     @abstractmethod
+    async def title(self) -> str | None:
+        """The session's title once the agent has named it, else None."""
+
+    @abstractmethod
     async def interrupt(self) -> None:
         """Interrupt the in-flight turn, if any."""
 

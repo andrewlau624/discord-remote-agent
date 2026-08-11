@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import Config
+from src.forum import create_session_thread, ensure_forum, git_info
 from src.paginator import paginate
 from src.permissions import DiscordPermissionBroker
 from src.providers import claude as claude_provider
@@ -105,60 +106,103 @@ class RemoteAgentBot(commands.Bot):
             pin.provider, cwd=cwd, channel_id=channel_id, resume=pin.session_id, session_id=None
         )
         await provider.start()
-        session = Session(self, self.store, channel_id, provider, pin.provider)
+        session = Session(
+            self, self.store, channel_id, provider, pin.provider, pre_named=True
+        )
         self.sessions[channel_id] = session
         return session
 
     # ---- shared command logic -------------------------------------------
 
-    async def do_new(self, channel: discord.abc.GuildChannel, cwd: str | None) -> str:
-        cid = channel.id
-        if self.store.get(cid) is not None:
-            return "This channel is already pinned to a session. Stop it first."
-        provider_name = self.pending_provider.get(cid, "claude")
+    async def _open_thread(
+        self, guild: discord.Guild, name: str, session_id: str, cwd: str
+    ) -> discord.Thread:
+        forum = await ensure_forum(guild)
+        return await create_session_thread(forum, name, session_id, cwd)
+
+    async def do_new(self, guild: discord.Guild | None, cwd: str | None) -> str:
+        if guild is None:
+            return "Run this in a server."
+        provider_name = self.pending_provider.get(guild.id, "claude")
         work_dir = cwd or self.config.launch_cwd
         if not os.path.isdir(work_dir):
             return f"`{work_dir}` is not a directory."
         session_id = str(uuid.uuid4())
+        repo, branch = git_info(work_dir)
+        try:
+            thread = await self._open_thread(
+                guild, f"{repo} ({branch})", session_id, work_dir
+            )
+        except discord.Forbidden:
+            return "I need Manage Channels to create the sessions forum."
+        except discord.HTTPException as exc:
+            return f"Could not create the session thread: `{exc}`"
+
         try:
             provider = self._make_provider(
-                provider_name, cwd=work_dir, channel_id=cid, resume=None, session_id=session_id
+                provider_name, cwd=work_dir, channel_id=thread.id, resume=None, session_id=session_id
             )
             await provider.start()
         except Exception as exc:
             return f"Failed to start: `{exc}`"
-        self.sessions[cid] = Session(self, self.store, cid, provider, provider_name)
-        self.store.pin(cid, provider_name, provider.session_id or session_id)
-        return f"Pinned a **{provider_name}** session in `{work_dir}`. Type here to talk to it."
+        self.sessions[thread.id] = Session(
+            self, self.store, thread.id, provider, provider_name, pre_named=False
+        )
+        self.store.pin(thread.id, provider_name, provider.session_id or session_id)
+        return f"Started a **{provider_name}** session in {thread.mention}."
 
     async def do_resume(
-        self, channel: discord.abc.GuildChannel, session_id: str, cwd: str | None
+        self, guild: discord.Guild | None, session_id: str, cwd: str | None
     ) -> str:
-        cid = channel.id
-        if self.store.get(cid) is not None:
-            return "This channel is already pinned to a session. Stop it first."
+        if guild is None:
+            return "Run this in a server."
         pin = self.store.find_by_session_id(session_id)
-        provider_name = pin.provider if pin else self.pending_provider.get(cid, "claude")
+        provider_name = pin.provider if pin else self.pending_provider.get(guild.id, "claude")
         work_dir = cwd or claude_provider.session_cwd(session_id)
         if not work_dir or not os.path.isdir(work_dir):
             return "Could not find that session's directory. Pass a cwd."
+
+        # Reuse the existing thread if it is still around.
+        if pin:
+            existing = self.get_channel(pin.channel_id)
+            if existing is not None:
+                if pin.channel_id in self.sessions:
+                    return f"That session is already open in {existing.mention}."
+                try:
+                    if isinstance(existing, discord.Thread) and existing.archived:
+                        await existing.edit(archived=False)
+                    await self._resume_pin(pin.channel_id)
+                except Exception as exc:
+                    return f"Failed to resume: `{exc}`"
+                return f"Resumed in {existing.mention}."
+
+        name = claude_provider.session_title(session_id) or "{} ({})".format(*git_info(work_dir))
+        try:
+            thread = await self._open_thread(guild, name, session_id, work_dir)
+        except discord.Forbidden:
+            return "I need Manage Channels to create the sessions forum."
+        except discord.HTTPException as exc:
+            return f"Could not create the session thread: `{exc}`"
+
         try:
             provider = self._make_provider(
-                provider_name, cwd=work_dir, channel_id=cid, resume=session_id, session_id=None
+                provider_name, cwd=work_dir, channel_id=thread.id, resume=session_id, session_id=None
             )
             await provider.start()
         except Exception as exc:
             return f"Failed to resume: `{exc}`"
-        if pin and pin.channel_id != cid:
+        if pin and pin.channel_id != thread.id:
             self.store.unpin(pin.channel_id)
-        self.sessions[cid] = Session(self, self.store, cid, provider, provider_name)
-        self.store.pin(cid, provider_name, session_id)
-        return f"Resumed `{session_id}` in `{work_dir}`."
+        self.sessions[thread.id] = Session(
+            self, self.store, thread.id, provider, provider_name, pre_named=True
+        )
+        self.store.pin(thread.id, provider_name, session_id)
+        return f"Resumed in {thread.mention}."
 
     async def do_stop(self, channel: discord.abc.GuildChannel) -> str:
         cid = channel.id
         if self.store.get(cid) is None:
-            return "No session pinned here."
+            return "No session here."
         session = self.sessions.pop(cid, None)
         if session is not None:
             try:
@@ -166,7 +210,12 @@ class RemoteAgentBot(commands.Bot):
             except Exception as exc:
                 log.warning("Error stopping session: %s", exc)
         self.store.unpin(cid)
-        return "Stopped. Channel is free for a new session."
+        if isinstance(channel, discord.Thread):
+            try:
+                await channel.edit(archived=True, locked=True)
+            except discord.HTTPException:
+                pass
+        return "Stopped and archived this session."
 
     async def do_interrupt(self, channel: discord.abc.GuildChannel) -> str:
         session = self.sessions.get(channel.id)
@@ -175,10 +224,12 @@ class RemoteAgentBot(commands.Bot):
         await session.interrupt()
         return "Interrupt sent."
 
-    async def do_provider(self, channel: discord.abc.GuildChannel, name: str) -> str:
+    async def do_provider(self, guild: discord.Guild | None, name: str) -> str:
+        if guild is None:
+            return "Run this in a server."
         if name not in SUPPORTED_PROVIDERS:
             return f"Unknown provider. Options: {', '.join(SUPPORTED_PROVIDERS)}."
-        self.pending_provider[channel.id] = name
+        self.pending_provider[guild.id] = name
         return f"Provider set to **{name}** for the next new session."
 
     async def do_skill(
@@ -210,14 +261,14 @@ class RemoteAgentBot(commands.Bot):
     def help_text(self) -> str:
         p = self.config.prefix
         rows = [
-            ("new [cwd]", "start a session here"),
-            ("resume <id> [cwd]", "resume a session and pin it here"),
+            ("new [cwd]", "start a session (opens a thread in the sessions forum)"),
+            ("resume <id> [cwd]", "resume a session in a thread"),
             ("list", "show resumable sessions"),
             ("skills", "list available skills"),
-            ("skill <name> [args]", "run a skill in this session"),
+            ("skill <name> [args]", "run a skill in this session thread"),
             ("provider <name>", "set provider for the next new"),
             ("interrupt", "stop the current turn"),
-            ("stop", "end this channel's session"),
+            ("stop", "end this session and archive its thread"),
         ]
         lines = [f"Commands (use `/` or `{p}`):"]
         lines += [f"`{p}{cmd}` {desc}" for cmd, desc in rows]
@@ -258,16 +309,16 @@ def register_slash(bot: RemoteAgentBot) -> None:
     @app_commands.describe(cwd="Working directory (defaults to where the bot runs)")
     async def new(interaction: discord.Interaction, cwd: str | None = None) -> None:
         await interaction.response.defer(ephemeral=True)
-        msg = await bot.do_new(interaction.channel, cwd)
+        msg = await bot.do_new(interaction.guild, cwd)
         await interaction.followup.send(msg, ephemeral=True)
 
-    @bot.tree.command(name="resume", description="Resume a session and pin it here.")
+    @bot.tree.command(name="resume", description="Resume a session in a new thread.")
     @app_commands.describe(session_id="Agent session id", cwd="Override working directory")
     async def resume(
         interaction: discord.Interaction, session_id: str, cwd: str | None = None
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-        msg = await bot.do_resume(interaction.channel, session_id, cwd)
+        msg = await bot.do_resume(interaction.guild, session_id, cwd)
         await interaction.followup.send(msg, ephemeral=True)
 
     @bot.tree.command(name="list", description="Show resumable sessions.")
@@ -297,7 +348,7 @@ def register_slash(bot: RemoteAgentBot) -> None:
     async def provider_cmd(
         interaction: discord.Interaction, name: app_commands.Choice[str]
     ) -> None:
-        msg = await bot.do_provider(interaction.channel, name.value)
+        msg = await bot.do_provider(interaction.guild, name.value)
         await interaction.response.send_message(msg, ephemeral=True)
 
     @bot.tree.command(name="interrupt", description="Interrupt the running turn.")
@@ -320,13 +371,13 @@ def register_slash(bot: RemoteAgentBot) -> None:
 def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="new")
     async def new_cmd(ctx: commands.Context, cwd: str | None = None) -> None:
-        await ctx.channel.send(await bot.do_new(ctx.channel, cwd))
+        await ctx.channel.send(await bot.do_new(ctx.guild, cwd))
 
     @bot.command(name="resume")
     async def resume_cmd(
         ctx: commands.Context, session_id: str, cwd: str | None = None
     ) -> None:
-        await ctx.channel.send(await bot.do_resume(ctx.channel, session_id, cwd))
+        await ctx.channel.send(await bot.do_resume(ctx.guild, session_id, cwd))
 
     @bot.command(name="list")
     async def list_cmd(ctx: commands.Context) -> None:
@@ -342,7 +393,7 @@ def register_chat(bot: RemoteAgentBot) -> None:
 
     @bot.command(name="provider")
     async def provider_cmd(ctx: commands.Context, name: str) -> None:
-        await ctx.channel.send(await bot.do_provider(ctx.channel, name))
+        await ctx.channel.send(await bot.do_provider(ctx.guild, name))
 
     @bot.command(name="interrupt")
     async def interrupt_cmd(ctx: commands.Context) -> None:

@@ -1,9 +1,8 @@
-"""SQLite store for channel pins.
+"""SQLite store binding a session thread to an agent session.
 
-One row per channel means one session pinned to that channel. The row holds the
-session id so a pin survives restarts; cwd and titles come from the provider's
-own session data, not from here. Stopping a session deletes the row and frees
-the channel.
+One row per thread (a thread id is a channel id). The row holds the session id so
+a binding survives restarts; cwd and titles come from the provider's own session
+data, not from here. Stopping a session deletes the row.
 """
 
 from __future__ import annotations

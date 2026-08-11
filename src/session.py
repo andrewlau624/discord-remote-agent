@@ -23,6 +23,7 @@ class Session:
         channel_id: int,
         provider: Provider,
         provider_name: str,
+        pre_named: bool = False,
     ) -> None:
         self._bot = bot
         self._store = store
@@ -30,6 +31,7 @@ class Session:
         self.provider = provider
         self.provider_name = provider_name
         self._lock = asyncio.Lock()
+        self._named = pre_named
 
     async def _channel(self) -> discord.abc.Messageable | None:
         ch = self._bot.get_channel(self.channel_id)
@@ -57,6 +59,26 @@ class Session:
 
             if self.provider.session_id:
                 self._store.set_session_id(self.channel_id, self.provider.session_id)
+
+            await self._maybe_name_thread()
+
+    async def _maybe_name_thread(self) -> None:
+        """Rename the session thread once the agent has titled the session."""
+        if self._named:
+            return
+        try:
+            title = await self.provider.title()
+        except Exception:
+            return
+        if not title:
+            return
+        channel = self._bot.get_channel(self.channel_id)
+        if isinstance(channel, discord.Thread):
+            try:
+                await channel.edit(name=title[:100])
+                self._named = True
+            except discord.HTTPException:
+                pass
 
     async def interrupt(self) -> None:
         await self.provider.interrupt()

@@ -43,6 +43,14 @@ def recent_sessions(limit: int = 100) -> list:
     return list_sessions(limit=limit)
 
 
+def session_title(session_id: str) -> str | None:
+    """The agent-generated title/summary for a session, if any."""
+    info = get_session_info(session_id)
+    if not info:
+        return None
+    return info.custom_title or info.summary or None
+
+
 def _build_options(
     *,
     cwd: str,
@@ -169,6 +177,11 @@ class ClaudeProvider(Provider):
             return []
         info = await self._client.get_server_info()
         return list(info.get("commands", [])) if info else []
+
+    async def title(self) -> str | None:
+        if not self.session_id:
+            return None
+        return session_title(self.session_id)
 
     async def run_turn(self, text: str) -> AsyncIterator[Block]:
         if self._client is None:
