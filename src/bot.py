@@ -124,6 +124,21 @@ class RemoteAgentBot(commands.Bot):
 
     # ---- shared command logic -------------------------------------------
 
+    def _resolve_cwd(self, cwd: str | None) -> str:
+        """Resolve a cwd argument against the configured base path.
+
+        No argument uses the base. A relative argument hangs off the base, so
+        `new discord-remote-agent` becomes `<base>/discord-remote-agent`.
+        Absolute paths and `~` are used as given.
+        """
+        base = os.path.expanduser(self.config.default_cwd or self.config.launch_cwd)
+        if not cwd:
+            return base
+        path = os.path.expanduser(cwd)
+        if os.path.isabs(path):
+            return path
+        return os.path.join(base, path)
+
     async def _open_thread(
         self, guild: discord.Guild, name: str, session_id: str, cwd: str
     ) -> discord.Thread:
@@ -148,7 +163,7 @@ class RemoteAgentBot(commands.Bot):
         if guild is None:
             return "Run this in a server."
         provider_name = self.pending_provider.get(guild.id, "claude")
-        work_dir = cwd or self.config.launch_cwd
+        work_dir = self._resolve_cwd(cwd)
         if not os.path.isdir(work_dir):
             return f"`{work_dir}` is not a directory."
         session_id = str(uuid.uuid4())
@@ -182,7 +197,7 @@ class RemoteAgentBot(commands.Bot):
             return "Run this in a server."
         pin = self.store.find_by_session_id(session_id)
         provider_name = pin.provider if pin else self.pending_provider.get(guild.id, "claude")
-        work_dir = cwd or claude_provider.session_cwd(session_id)
+        work_dir = self._resolve_cwd(cwd) if cwd else claude_provider.session_cwd(session_id)
         if not work_dir or not os.path.isdir(work_dir):
             return "Could not find that session's directory. Pass a cwd."
 
@@ -299,7 +314,7 @@ class RemoteAgentBot(commands.Bot):
     def help_text(self) -> str:
         p = self.config.prefix
         rows = [
-            ("new [cwd]", "start a session (opens a thread in the sessions forum)"),
+            ("new [repo]", "start a session (repo name under the base path, or a full path)"),
             ("resume <id> [cwd]", "resume a session in a thread"),
             ("list", "show resumable sessions"),
             ("skills", "list available skills"),
@@ -345,7 +360,7 @@ class RemoteAgentBot(commands.Bot):
 
 def register_slash(bot: RemoteAgentBot) -> None:
     @bot.tree.command(name="new", description="Start a session pinned to this channel.")
-    @app_commands.describe(cwd="Working directory (defaults to where the bot runs)")
+    @app_commands.describe(cwd="Repo name under the base path, or a full path")
     async def new(interaction: discord.Interaction, cwd: str | None = None) -> None:
         await interaction.response.defer(ephemeral=True)
         msg = await bot.do_new(interaction.guild, cwd)

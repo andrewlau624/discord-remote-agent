@@ -64,6 +64,7 @@ Secrets and identity live in `.env`. Everything else is in `config.toml`:
 
 - `prefix` for chat commands (default `!`)
 - `model` for Claude Code (blank uses the default)
+- `default_cwd`, the base path for new sessions (blank uses the launch dir)
 - `approval_timeout` in seconds
 - `db_path` for the pin database
 - `skills` to load ("all", "none", or a list)
@@ -73,7 +74,7 @@ Secrets and identity live in `.env`. Everything else is in `config.toml`:
 
 Every command works as `/name` or `<prefix>name` (default `!name`).
 
-- `new [cwd]` start a session, opens a thread (cwd defaults to where the bot runs)
+- `new [repo]` start a session, opens a thread (a repo name resolves under `default_cwd`, or pass a full path)
 - `resume <session_id> [cwd]` resume a session in a thread
 - `list` show resumable sessions (paged), 📌 marks open ones
 - `provider <name>` pick the provider for the next `new`

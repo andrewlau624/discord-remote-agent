@@ -35,6 +35,7 @@ class Config:
     guild_id: int | None
     launch_cwd: str
     prefix: str = "!"
+    default_cwd: str = ""
     model: str | None = None
     approval_timeout: int = 300
     db_path: str = "sessions.db"
@@ -73,6 +74,7 @@ class Config:
             guild_id=guild_id,
             launch_cwd=os.getcwd(),
             prefix=str(bot.get("prefix", "!")) or "!",
+            default_cwd=str(bot.get("default_cwd", "")).strip(),
             model=model,
             approval_timeout=int(bot.get("approval_timeout", 300)),
             db_path=str(bot.get("db_path", "sessions.db")) or "sessions.db",
