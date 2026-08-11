@@ -62,6 +62,10 @@ class Provider(ABC):
         """Send input and yield blocks until the turn ends (async generator)."""
 
     @abstractmethod
+    async def list_commands(self) -> list[dict[str, Any]]:
+        """Available skills/commands, as {name, description} dicts."""
+
+    @abstractmethod
     async def interrupt(self) -> None:
         """Interrupt the in-flight turn, if any."""
 

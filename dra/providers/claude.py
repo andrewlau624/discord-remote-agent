@@ -23,13 +23,65 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
+    get_session_info,
 )
 
 from dra.providers.base import Block, BlockKind, PermissionBroker, Provider
 
+_SETTING_SOURCES = ["user", "project", "local"]
+
+
+def session_cwd(session_id: str) -> str | None:
+    """Resolve a session's working directory from Claude's own session data."""
+    info = get_session_info(session_id)
+    return info.cwd if info else None
+
+
+def _build_options(
+    *,
+    cwd: str,
+    resume: str | None,
+    session_id: str | None,
+    allowed_tools: list[str],
+    skills: Any,
+    model: str | None,
+    can_use_tool: Any = None,
+) -> ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        cwd=cwd,
+        resume=resume,
+        session_id=session_id,
+        permission_mode="default",
+        allowed_tools=allowed_tools,
+        can_use_tool=can_use_tool,
+        model=model,
+        skills=skills,
+        setting_sources=_SETTING_SOURCES,
+    )
+
+
+async def fetch_commands(
+    cwd: str, *, skills: Any, model: str | None
+) -> list[dict[str, Any]]:
+    """Connect a throwaway client just to read available skills/commands."""
+    options = _build_options(
+        cwd=cwd,
+        resume=None,
+        session_id=None,
+        allowed_tools=[],
+        skills=skills,
+        model=model,
+    )
+    client = ClaudeSDKClient(options=options)
+    await client.connect()
+    try:
+        info = await client.get_server_info()
+    finally:
+        await client.disconnect()
+    return list(info.get("commands", [])) if info else []
+
 
 def _stringify_tool_result(content: Any) -> str:
-    """ToolResultBlock.content is str | list[dict] | None."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -47,7 +99,6 @@ def _stringify_tool_result(content: Any) -> str:
 
 
 def _format_tool_input(name: str, tool_input: dict[str, Any]) -> str:
-    """Render a tool call's input compactly for display."""
     if name == "Bash":
         return str(tool_input.get("command", ""))
     if name in ("Write", "Edit", "Read", "NotebookEdit"):
@@ -70,15 +121,20 @@ class ClaudeProvider(Provider):
         channel_id: int,
         broker: PermissionBroker,
         allowed_tools: list[str],
-        resume: str | None = None,
+        skills: Any = "all",
         model: str | None = None,
+        resume: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.cwd = cwd
         self.channel_id = channel_id
         self.broker = broker
         self.allowed_tools = allowed_tools
+        self.skills = skills
         self.model = model
-        self.session_id = resume  # if set, resume that session on start()
+        self._resume = resume
+        self._new_session_id = session_id
+        self.session_id = resume or session_id
         self._client: ClaudeSDKClient | None = None
 
     async def _can_use_tool(self, tool_name, tool_input, context):  # noqa: ANN001
@@ -90,16 +146,23 @@ class ClaudeProvider(Provider):
         return PermissionResultDeny(message=reason or "Denied by user.")
 
     async def start(self) -> None:
-        options = ClaudeAgentOptions(
+        options = _build_options(
             cwd=self.cwd,
-            resume=self.session_id,
-            permission_mode="default",
+            resume=self._resume,
+            session_id=None if self._resume else self._new_session_id,
             allowed_tools=self.allowed_tools,
-            can_use_tool=self._can_use_tool,
+            skills=self.skills,
             model=self.model,
+            can_use_tool=self._can_use_tool,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
+
+    async def list_commands(self) -> list[dict[str, Any]]:
+        if self._client is None:
+            return []
+        info = await self._client.get_server_info()
+        return list(info.get("commands", [])) if info else []
 
     async def run_turn(self, text: str) -> AsyncIterator[Block]:
         if self._client is None:

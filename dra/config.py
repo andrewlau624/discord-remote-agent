@@ -1,8 +1,9 @@
-"""Config from .env and the environment."""
+"""Config from .env (secrets) and config.toml (behavior)."""
 
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,13 +18,19 @@ def _load_dotenv(path: str = ".env") -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        key = key.strip()
-        val = val.strip().strip('"').strip("'")
-        os.environ.setdefault(key, val)
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
 def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _read_toml(path: str) -> dict:
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    with p.open("rb") as fh:
+        return tomllib.load(fh)
 
 
 @dataclass(frozen=True)
@@ -31,14 +38,15 @@ class Config:
     token: str
     owner_ids: frozenset[int]
     guild_id: int | None
-    default_cwd: str
-    auto_approve_tools: list[str] = field(default_factory=list)
+    launch_cwd: str
     model: str | None = None
-    db_path: str = "sessions.db"
     approval_timeout: int = 300
+    db_path: str = "sessions.db"
+    skills: str | list[str] | None = "all"
+    auto_approve_tools: list[str] = field(default_factory=list)
 
     @classmethod
-    def load(cls, dotenv_path: str = ".env") -> "Config":
+    def load(cls, dotenv_path: str = ".env", toml_path: str = "config.toml") -> "Config":
         _load_dotenv(dotenv_path)
 
         token = os.environ.get("DISCORD_TOKEN", "").strip()
@@ -47,9 +55,8 @@ class Config:
                 "DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in."
             )
 
-        owner_raw = _split_csv(os.environ.get("OWNER_IDS", ""))
         try:
-            owner_ids = frozenset(int(x) for x in owner_raw)
+            owner_ids = frozenset(int(x) for x in _split_csv(os.environ.get("OWNER_IDS", "")))
         except ValueError as exc:
             raise SystemExit(f"OWNER_IDS must be integer user IDs: {exc}") from exc
         if not owner_ids:
@@ -61,24 +68,28 @@ class Config:
         guild_raw = os.environ.get("GUILD_ID", "").strip()
         guild_id = int(guild_raw) if guild_raw else None
 
-        default_cwd = os.environ.get("DEFAULT_CWD", os.getcwd()).strip() or os.getcwd()
+        toml = _read_toml(toml_path)
+        bot = toml.get("bot", {})
+        tools = toml.get("tools", {})
 
-        model = os.environ.get("MODEL", "").strip() or None
+        model = str(bot.get("model", "")).strip() or None
 
-        try:
-            approval_timeout = int(os.environ.get("APPROVAL_TIMEOUT", "300"))
-        except ValueError:
-            approval_timeout = 300
+        skills_raw = bot.get("skills", "all")
+        if isinstance(skills_raw, str):
+            skills: str | list[str] | None = None if skills_raw.lower() in ("none", "") else skills_raw
+        elif isinstance(skills_raw, list):
+            skills = [str(s) for s in skills_raw]
+        else:
+            skills = "all"
 
         return cls(
             token=token,
             owner_ids=owner_ids,
             guild_id=guild_id,
-            default_cwd=default_cwd,
-            auto_approve_tools=_split_csv(
-                os.environ.get("AUTO_APPROVE_TOOLS", "Read,Glob,Grep")
-            ),
+            launch_cwd=os.getcwd(),
             model=model,
-            db_path=os.environ.get("DB_PATH", "sessions.db").strip() or "sessions.db",
-            approval_timeout=approval_timeout,
+            approval_timeout=int(bot.get("approval_timeout", 300)),
+            db_path=str(bot.get("db_path", "sessions.db")) or "sessions.db",
+            skills=skills,
+            auto_approve_tools=[str(t) for t in tools.get("auto_approve", [])],
         )

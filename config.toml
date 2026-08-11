@@ -1,0 +1,15 @@
+# Behavior settings. Secrets live in .env, not here.
+
+[bot]
+# Model for Claude Code. Blank uses Claude Code's default.
+model = ""
+# Seconds to wait for a tool approval before denying.
+approval_timeout = 300
+# SQLite file for channel pins.
+db_path = "sessions.db"
+# Skills to load: "all", "none", or a list like ["pdf", "xlsx"].
+skills = "all"
+
+[tools]
+# Tools that run without asking. Anything else pops an approval poll.
+auto_approve = ["Read", "Glob", "Grep", "NotebookRead", "TodoWrite"]

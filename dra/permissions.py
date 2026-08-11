@@ -1,48 +1,22 @@
-"""Tool approvals via Discord buttons.
+"""Tool approvals via Discord polls.
 
-request() posts an embed with Approve/Deny buttons and waits for the owner to
-click. On timeout it denies so a forgotten prompt can't hang a session.
+request() posts the tool detail, then a poll with Approve/Deny. It waits for the
+owner's vote and denies on timeout so a forgotten prompt can't hang a session.
+If polls can't be sent, it falls back to emoji reactions.
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from typing import Any
 
 import discord
 
 from dra.render import permission_embed
 
-
-class _ApprovalView(discord.ui.View):
-    def __init__(self, owner_ids: frozenset[int], timeout: float) -> None:
-        super().__init__(timeout=timeout)
-        self._owner_ids = owner_ids
-        self.future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
-
-    async def _resolve(self, interaction: discord.Interaction, allowed: bool) -> None:
-        if interaction.user.id not in self._owner_ids:
-            await interaction.response.send_message(
-                "You are not allowed to decide this.", ephemeral=True
-            )
-            return
-        if not self.future.done():
-            self.future.set_result(allowed)
-        verb = "Approved" if allowed else "Denied"
-        for child in self.children:
-            child.disabled = True  # type: ignore[attr-defined]
-        await interaction.response.edit_message(
-            content=f"**{verb}** by {interaction.user.display_name}", view=self
-        )
-        self.stop()
-
-    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, _button) -> None:  # noqa: ANN001
-        await self._resolve(interaction, True)
-
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
-    async def deny(self, interaction: discord.Interaction, _button) -> None:  # noqa: ANN001
-        await self._resolve(interaction, False)
+_APPROVE = "✅"
+_DENY = "🛑"
 
 
 class DiscordPermissionBroker:
@@ -59,21 +33,67 @@ class DiscordPermissionBroker:
     ) -> tuple[bool, str | None]:
         channel = self._bot.get_channel(channel_id)
         if channel is None or not isinstance(channel, discord.abc.Messageable):
-            # No channel to ask in, so deny.
             return False, "No channel available to request approval."
 
-        view = _ApprovalView(self._owner_ids, timeout=float(self._timeout))
-        message = await channel.send(embed=permission_embed(tool_name, tool_input), view=view)
+        await channel.send(embed=permission_embed(tool_name, tool_input))
 
         try:
-            allowed = await asyncio.wait_for(view.future, timeout=self._timeout)
+            return await self._ask_poll(channel, tool_name)
+        except (discord.HTTPException, TypeError):
+            return await self._ask_reactions(channel, tool_name)
+
+    async def _ask_poll(
+        self, channel: discord.abc.Messageable, tool_name: str
+    ) -> tuple[bool, str | None]:
+        poll = discord.Poll(
+            question=f"Approve {tool_name}?", duration=timedelta(hours=1)
+        )
+        poll.add_answer(text="Approve", emoji=_APPROVE)  # answer_id 1
+        poll.add_answer(text="Deny", emoji=_DENY)  # answer_id 2
+        message = await channel.send(poll=poll)
+
+        def check(payload: discord.RawPollVoteActionEvent) -> bool:
+            return payload.message_id == message.id and payload.user_id in self._owner_ids
+
+        try:
+            payload = await self._bot.wait_for(
+                "raw_poll_vote_add", check=check, timeout=self._timeout
+            )
+            allowed = payload.answer_id == 1
         except asyncio.TimeoutError:
-            for child in view.children:
-                child.disabled = True  # type: ignore[attr-defined]
-            try:
-                await message.edit(content="⏱️ Timed out, denied.", view=view)
-            except discord.HTTPException:
-                pass
+            allowed = False
+            payload = None
+
+        try:
+            await message.end_poll()
+        except discord.HTTPException:
+            pass
+
+        if allowed:
+            return True, None
+        return False, "Approval timed out." if payload is None else "Denied by user."
+
+    async def _ask_reactions(
+        self, channel: discord.abc.Messageable, tool_name: str
+    ) -> tuple[bool, str | None]:
+        message = await channel.send(f"Approve **{tool_name}**? React {_APPROVE} or {_DENY}.")
+        await message.add_reaction(_APPROVE)
+        await message.add_reaction(_DENY)
+
+        def check(reaction: discord.Reaction, user: discord.abc.User) -> bool:
+            return (
+                reaction.message.id == message.id
+                and user.id in self._owner_ids
+                and str(reaction.emoji) in (_APPROVE, _DENY)
+            )
+
+        try:
+            reaction, _user = await self._bot.wait_for(
+                "reaction_add", check=check, timeout=self._timeout
+            )
+        except asyncio.TimeoutError:
             return False, "Approval timed out."
 
-        return allowed, None if allowed else "Denied by user."
+        return (str(reaction.emoji) == _APPROVE), (
+            None if str(reaction.emoji) == _APPROVE else "Denied by user."
+        )

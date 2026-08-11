@@ -1,32 +1,31 @@
-"""Render normalized Blocks into Discord embeds (+ file attachments).
+"""Render Blocks into Discord embeds, chunking long bodies across messages.
 
-Discord limits we respect: embed description <= 4096 chars, message content
-<= 2000. Long tool output is truncated in the embed and attached in full as a
-.txt file so nothing is silently lost.
+Discord caps embed descriptions at 4096 chars. Long output is split into several
+embeds; anything past a few chunks is attached in full as a .txt file so nothing
+is lost.
 """
 
 from __future__ import annotations
 
 import io
+import json
 
 import discord
 
 from dra.providers.base import Block, BlockKind
 
-# description budget, leaving room for code fences / ellipsis
-_MAX_DESC = 3800
-_FILE_THRESHOLD = 3800
+_CHUNK = 3800  # leave room for code fences under the 4096 limit
+_MAX_EMBEDS = 6  # beyond this, attach the rest as a file
 
 _STYLE = {
-    BlockKind.THINKING: ("\U0001f4ad Thinking", 0x95A5A6),      # grey
-    BlockKind.TEXT: (None, 0x5865F2),                            # blurple
-    BlockKind.TOOL_CALL: ("\U0001f527 Tool", 0x3498DB),          # blue
-    BlockKind.TOOL_RESULT: ("✅ Result", 0x2ECC71),          # green
-    BlockKind.STATUS: ("ℹ️", 0x2B2D31),                # dark
-    BlockKind.ERROR: ("❌ Error", 0xE74C3C),                 # red
+    BlockKind.THINKING: ("\U0001f4ad Thinking", 0x95A5A6),
+    BlockKind.TEXT: (None, 0x5865F2),
+    BlockKind.TOOL_CALL: ("\U0001f527 Tool", 0x3498DB),
+    BlockKind.TOOL_RESULT: ("✅ Result", 0x2ECC71),
+    BlockKind.STATUS: ("ℹ️", 0x2B2D31),
+    BlockKind.ERROR: ("❌ Error", 0xE74C3C),
 }
 
-# Tools whose bodies read better as a shell/code block.
 _CODE_TOOLS = {"Bash"}
 
 
@@ -34,66 +33,58 @@ def _fence(text: str, lang: str = "") -> str:
     return f"```{lang}\n{text}\n```"
 
 
+def _chunks(text: str, size: int) -> list[str]:
+    if not text:
+        return [""]
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
 def render_block(block: Block) -> tuple[list[discord.Embed], list[discord.File]]:
-    """Return (embeds, files) for one block."""
     default_title, color = _STYLE[block.kind]
     if block.kind == BlockKind.TOOL_RESULT and block.is_error:
         color = _STYLE[BlockKind.ERROR][1]
-
     title = block.title or default_title
     body = block.body or ""
+
+    fenced = block.kind in (BlockKind.TOOL_CALL, BlockKind.TOOL_RESULT)
+    lang = "bash" if block.meta.get("tool") in _CODE_TOOLS else ""
+
     files: list[discord.File] = []
-
-    # Decide whether to code-fence the body.
-    fence_lang = ""
-    use_fence = False
-    if block.kind == BlockKind.TOOL_CALL:
-        use_fence = True
-        fence_lang = "bash" if block.meta.get("tool") in _CODE_TOOLS else ""
-    elif block.kind == BlockKind.TOOL_RESULT:
-        use_fence = True
-
+    parts = _chunks(body, _CHUNK)
     truncated = False
-    if len(body) > _FILE_THRESHOLD and block.kind in (
-        BlockKind.TOOL_RESULT,
-        BlockKind.TOOL_CALL,
-    ):
-        # Attach full body; show a head in the embed.
-        buf = io.BytesIO(body.encode("utf-8"))
-        files.append(discord.File(buf, filename=f"{block.kind.value}.txt"))
-        body = body[:_MAX_DESC]
+    if len(parts) > _MAX_EMBEDS:
+        files.append(
+            discord.File(io.BytesIO(body.encode("utf-8")), filename=f"{block.kind.value}.txt")
+        )
+        parts = parts[:_MAX_EMBEDS]
         truncated = True
 
-    if use_fence:
-        description = _fence(body if body else "(empty)", fence_lang)
-    else:
-        description = body if body else "(empty)"
+    embeds: list[discord.Embed] = []
+    for i, part in enumerate(parts):
+        text = part if part else "(empty)"
+        description = _fence(text, lang) if fenced else text
+        if len(description) > 4096:
+            description = description[: 4096 - 4] + "\n..."
+        embed = discord.Embed(description=description, color=color)
+        if i == 0 and title:
+            embed.title = title[:256]
+        embeds.append(embed)
 
-    if len(description) > 4096:
-        description = description[: 4096 - 4] + "\n..."
+    if truncated and embeds:
+        embeds[-1].set_footer(text="output truncated, full content attached")
 
-    embed = discord.Embed(description=description, color=color)
-    if title:
-        embed.title = title[:256]
-    if truncated:
-        embed.set_footer(text="output truncated, full content attached")
-
-    return [embed], files
+    return embeds, files
 
 
 def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
-    """Embed shown alongside Approve/Deny buttons."""
     if tool_name == "Bash":
         body = _fence(str(tool_input.get("command", "")), "bash")
     elif tool_name in ("Write", "Edit", "NotebookEdit"):
         path = tool_input.get("file_path", "")
         body = f"**{path}**"
         if tool_name == "Write" and "content" in tool_input:
-            preview = str(tool_input["content"])[:1500]
-            body += "\n" + _fence(preview)
+            body += "\n" + _fence(str(tool_input["content"])[:1500])
     else:
-        import json
-
         try:
             body = _fence(json.dumps(tool_input, ensure_ascii=False, indent=2)[:1500])
         except (TypeError, ValueError):
@@ -103,9 +94,35 @@ def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
         body = body[: 4096 - 4] + "\n..."
 
     embed = discord.Embed(
-        title=f"\U0001f6d1 Approve tool: {tool_name}",
-        description=body,
-        color=0xF1C40F,  # amber
+        title=f"\U0001f6d1 Tool request: {tool_name}", description=body, color=0xF1C40F
     )
-    embed.set_footer(text="Only the owner can decide.")
     return embed
+
+
+def command_embeds(commands: list[dict]) -> list[discord.Embed]:
+    """Render the skill/command list into one or more embeds."""
+    lines: list[str] = []
+    for cmd in sorted(commands, key=lambda c: str(c.get("name", ""))):
+        name = str(cmd.get("name", "")).strip()
+        if not name:
+            continue
+        desc = " ".join(str(cmd.get("description", "")).split())
+        if len(desc) > 100:
+            desc = desc[:97] + "..."
+        lines.append(f"`/{name}` {desc}".rstrip())
+
+    if not lines:
+        return [discord.Embed(title="Skills", description="None found.", color=0x5865F2)]
+
+    embeds: list[discord.Embed] = []
+    buf = ""
+    for line in lines:
+        if len(buf) + len(line) + 1 > 3800:
+            embeds.append(discord.Embed(description=buf, color=0x5865F2))
+            buf = ""
+        buf += line + "\n"
+    if buf:
+        embeds.append(discord.Embed(description=buf, color=0x5865F2))
+    embeds[0].title = f"Skills ({len(lines)})"
+    embeds[0].set_footer(text="Run one with /skill <name>")
+    return embeds
