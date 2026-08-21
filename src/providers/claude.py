@@ -65,6 +65,12 @@ _IDLE_TIMEOUT = 600.0
 # How long the stream must be silent before a backlog drain is considered done.
 _DRAIN_QUIET = 1.0
 
+# How long to keep reading after a result that a settled task says should be
+# followed by a continuation turn. Waking the parent costs a model round-trip,
+# so this has to outlast normal API latency; it only ever delays the "Done"
+# status, since everything before it has already been rendered.
+_CONTINUATION_GRACE = 30.0
+
 
 class TaskLedger:
     """Delegated tasks (subagents, workflows) that are still running.
@@ -84,15 +90,35 @@ class TaskLedger:
     def __len__(self) -> int:
         return len(self._inflight)
 
-    def observe(self, message: Message) -> None:
+    def observe(self, message: Message) -> bool:
+        """Fold one message into the in-flight set.
+
+        Returns True when a *tracked* task just reached a terminal state. That
+        is the cue that the CLI will wake the parent for a continuation turn,
+        which the caller needs in order to tell a run-ending result apart from
+        one that merely closes the turn that dispatched the task.
+        """
         if isinstance(message, TaskStartedMessage):
             if message.task_type in _DEFERRING_TASK_TYPES:
                 self._inflight.add(message.task_id)
         elif isinstance(message, TaskNotificationMessage):
-            self._inflight.discard(message.task_id)
+            return self._settle(message.task_id)
         elif isinstance(message, TaskUpdatedMessage):
             if message.status in TERMINAL_TASK_STATUSES:
-                self._inflight.discard(message.task_id)
+                return self._settle(message.task_id)
+        return False
+
+    def _settle(self, task_id: str) -> bool:
+        """Clear a task, reporting whether it was one we were tracking.
+
+        Terminal completion can arrive twice for the same task (a notification
+        and a patch); only the first is reported, so a continuation is never
+        counted more than once.
+        """
+        if task_id in self._inflight:
+            self._inflight.discard(task_id)
+            return True
+        return False
 
 
 
@@ -371,8 +397,8 @@ class ClaudeProvider(Provider):
         async for block in self._read_until_run_end():
             yield block
 
-    async def _next_message(self) -> Any:
-        item = await asyncio.wait_for(self._queue.get(), timeout=_IDLE_TIMEOUT)
+    async def _next_message(self, timeout: float = _IDLE_TIMEOUT) -> Any:
+        item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
         if isinstance(item, BaseException):
             raise item
         return item
@@ -383,8 +409,16 @@ class ClaudeProvider(Provider):
         Pulls from the same stream a fresh turn would use, stopping once it
         has gone quiet for _DRAIN_QUIET seconds rather than at a single
         message — a stalled turn may have left more than one message queued.
+
+        Runs whenever the queue is non-empty, not only after a stall. Nothing
+        should be pending at the start of a turn, so anything sitting there is
+        output from the previous run that we stopped reading too early. Left
+        in place it would be interleaved with this turn's output and, worse,
+        its trailing result would end this turn before the new prompt was
+        answered — the "one turn behind" failure. Flushing first keeps the
+        stream and the turn boundaries aligned.
         """
-        if not self._stalled:
+        if not self._stalled and self._queue.empty():
             return
         while True:
             try:
@@ -408,11 +442,37 @@ class ClaudeProvider(Provider):
         delegated task (subagent, workflow) is still in flight. Otherwise the
         CLI will wake us with a follow-up turn once it finishes, so we keep
         reading past it instead of returning early.
+
+        An idle ledger is not on its own proof the run is over. A task that
+        settles *before* the result of the turn that spawned it leaves the
+        ledger empty at that result, yet its completion still wakes the parent
+        for a continuation turn. Returning there would strand that turn's
+        output in the queue, unread until the next prompt dragged it out —
+        the bot going quiet until you say "continue". So the two cases are
+        told apart by what already happened this run:
+
+        - a result was already consumed while a task was in flight, so the
+          continuation has been read and this result ends it;
+        - otherwise a settled task means the continuation is still coming, and
+          we keep reading through a grace window to catch it.
         """
+        deferred_result = False  # consumed a result while a task was running
+        settled_since_result = False  # a tracked task finished; a turn follows
+        pending_done: Block | None = None  # Done for a result held pending
         while True:
+            waiting = pending_done is not None
             try:
-                message = await self._next_message()
+                message = await self._next_message(
+                    _CONTINUATION_GRACE if waiting else _IDLE_TIMEOUT
+                )
             except TimeoutError:
+                if waiting:
+                    # The continuation never came, so the result we held was
+                    # the end of the run after all. Close the turn out rather
+                    # than holding the session open for the full idle timeout.
+                    log.debug("No continuation within %.0fs", _CONTINUATION_GRACE)
+                    yield pending_done
+                    return
                 self._stalled = True
                 log.warning(
                     "Turn stalled: no output for %.0fs with %d task(s) in flight",
@@ -431,13 +491,40 @@ class ClaudeProvider(Provider):
                     is_error=True,
                 )
                 return
-            self._ledger.observe(message)
+
+            # The continuation arrived, so the held result was not the end.
+            pending_done = None
+            if self._ledger.observe(message):
+                settled_since_result = True
             for block in self._map(message):
                 yield block
-            if isinstance(message, ResultMessage) and (
-                message.is_error or self._ledger.idle
-            ):
+            if not isinstance(message, ResultMessage):
+                continue
+
+            if message.is_error:
                 return
+            if not self._ledger.idle:
+                # Ends the turn, not the run: delegated work is still going.
+                deferred_result = True
+                settled_since_result = False
+                continue
+            if deferred_result or not settled_since_result:
+                # Either the continuation has already been read, or no task
+                # ran at all. Nothing more is coming.
+                yield self._done_block(message)
+                return
+            # A task settled with no result deferred, so this closes the turn
+            # that dispatched it and the continuation is still to come. Hold
+            # the Done and keep reading for it.
+            settled_since_result = False
+            pending_done = self._done_block(message)
+
+    @staticmethod
+    def _done_block(message: ResultMessage) -> Block:
+        bits = [f"{message.num_turns} turn(s)"]
+        if message.total_cost_usd:
+            bits.append(f"${message.total_cost_usd:.4f}")
+        return Block(BlockKind.STATUS, title="Done", body=" · ".join(bits))
 
     def _map(self, message: Any) -> list[Block]:
         blocks: list[Block] = []
@@ -555,16 +642,9 @@ class ClaudeProvider(Provider):
                         is_error=True,
                     )
                 )
-            elif self._ledger.idle:
-                bits = [f"{message.num_turns} turn(s)"]
-                if message.total_cost_usd:
-                    bits.append(f"${message.total_cost_usd:.4f}")
-                blocks.append(
-                    Block(BlockKind.STATUS, title="Done", body=" · ".join(bits))
-                )
-            # Otherwise this result only ends the turn: delegated tasks are
-            # still running and a follow-up turn is coming, so stay quiet
-            # rather than claiming the run is done.
+            # "Done" is not emitted here. Only the reader knows whether a
+            # result ends the run or merely the turn that dispatched a task,
+            # so it yields the status itself once it has decided.
             return blocks
 
         return blocks
