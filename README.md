@@ -74,11 +74,6 @@ Type them in any channel with the prefix (default `!`).
   restarts. Switching to `bypassPermissions` relaunches the session, since the
   CLI only honors bypass at launch.
 - `!view` open a panel to toggle what shows (thinking, tool calls, tool results)
-- `!terminal` create (or rebind) the #terminal channel to the current
-  session's folder, or the base path outside a session. Every message you
-  send there runs as a shell command and the output is relayed back; `cd`
-  persists between commands, long output is attached as a file. Bindings are
-  in memory, so run `!terminal` again after a bot restart.
 - `!interrupt` stop the current turn
 - `!stop` end this session and archive its thread
 - `!help` list commands
