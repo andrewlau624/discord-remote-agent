@@ -2,7 +2,9 @@
 
 Holds one connected ClaudeSDKClient per channel. Each message is a turn: query
 then drain the response, mapping SDK blocks to our Block type. Tools not in
-allowed_tools hit can_use_tool, which we send to the broker for approval.
+allowed_tools hit can_use_tool, which we send to the broker for approval --
+except edits under acceptEdits, which this layer approves itself because the
+CLI's mode never reaches a tool the callback already intercepted.
 
 A turn ends at a result frame, but only once no delegated task is still in
 flight. The CLI emits a result when the *turn* ends, not when the *run* ends:
@@ -44,7 +46,14 @@ from claude_agent_sdk import (
     list_sessions,
 )
 
-from src.providers.base import Block, BlockKind, PermissionBroker, Provider, TaskStatus
+from src.providers.base import (
+    Block,
+    BlockKind,
+    ContextState,
+    PermissionBroker,
+    Provider,
+    TaskStatus,
+)
 
 log = logging.getLogger("src")
 
@@ -64,6 +73,13 @@ _IDLE_TIMEOUT = 600.0
 
 # How long the stream must be silent before a backlog drain is considered done.
 _DRAIN_QUIET = 1.0
+
+# Tools acceptEdits is supposed to wave through. The CLI's own acceptEdits
+# never gets a say: the SDK only shadows can_use_tool for bypassPermissions and
+# for whole-tool allowed_tools entries, so under acceptEdits the callback still
+# fires and the broker polls for every edit. Honouring the mode here is what
+# makes it behave as its name claims.
+_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 # How long to keep reading after a result that a settled task says should be
 # followed by a continuation turn. Waking the parent costs a model round-trip,
@@ -242,6 +258,32 @@ def _format_ask_question(tool_input: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _context_from_usage(model_usage: dict[str, Any] | None) -> ContextState | None:
+    """Context fullness from a result's per-model usage.
+
+    `model_usage` has one entry per model that ran, and a subagent on a
+    smaller model would skew any total. The fullest window is the one that
+    matters -- it is the one that will force a compaction -- so entries are
+    scored individually and the highest kept.
+    """
+    best: ContextState | None = None
+    for name, usage in (model_usage or {}).items():
+        if not isinstance(usage, dict):
+            continue
+        limit = usage.get("contextWindow") or 0
+        if limit <= 0:
+            continue
+        used = (
+            (usage.get("inputTokens") or 0)
+            + (usage.get("cacheReadInputTokens") or 0)
+            + (usage.get("cacheCreationInputTokens") or 0)
+        )
+        state = ContextState(used=used, limit=limit, model=name)
+        if best is None or state.pct > best.pct:
+            best = state
+    return best
+
+
 def _format_task_usage(usage: dict[str, Any] | None) -> str:
     """One-line usage summary for a delegated task, e.g. '45.2k tokens · 12 tools · 8.3s'."""
     if not usage:
@@ -332,6 +374,8 @@ class ClaudeProvider(Provider):
         if tool_name == "AskUserQuestion":
             answer = await self.broker.ask(self.channel_id, tool_input)
             return PermissionResultDeny(message=answer)
+        if self.permission_mode == "acceptEdits" and tool_name in _EDIT_TOOLS:
+            return PermissionResultAllow()
         allowed, reason = await self.broker.request(
             self.channel_id, tool_name, tool_input
         )
@@ -519,12 +563,20 @@ class ClaudeProvider(Provider):
             settled_since_result = False
             pending_done = self._done_block(message)
 
-    @staticmethod
-    def _done_block(message: ResultMessage) -> Block:
+    def _done_block(self, message: ResultMessage) -> Block:
         bits = [f"{message.num_turns} turn(s)"]
         if message.total_cost_usd:
             bits.append(f"${message.total_cost_usd:.4f}")
+        state = _context_from_usage(message.model_usage)
+        if state is not None:
+            self.last_context = state
+            bits.append(f"{state.pct:.0f}% ctx")
         return Block(BlockKind.STATUS, title="Done", body=" · ".join(bits))
+
+    async def context_usage(self) -> dict[str, Any] | None:
+        if self._client is None:
+            return None
+        return await self._client.get_context_usage()
 
     def _map(self, message: Any) -> list[Block]:
         blocks: list[Block] = []

@@ -54,6 +54,28 @@ class Block:
     task_status: TaskStatus | None = None
 
 
+@dataclass
+class ContextState:
+    """How full a session's context window is.
+
+    Derived from the usage figures that ride along with every turn result, so
+    reading it costs nothing extra; `Provider.context_usage` is the separate,
+    more expensive call that breaks the same total down by category.
+    """
+
+    used: int
+    limit: int
+    model: str | None = None
+
+    @property
+    def pct(self) -> float:
+        return (self.used / self.limit * 100) if self.limit else 0.0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+
 @runtime_checkable
 class PermissionBroker(Protocol):
     """Decides whether a tool call may proceed (e.g. via Discord buttons)."""
@@ -77,6 +99,18 @@ class Provider(ABC):
 
     #: Populated once the underlying agent reports its session id.
     session_id: str | None = None
+
+    #: Context fullness as of the last completed turn, or None if the agent
+    #: has not reported usage yet. Updated by the provider as turns finish.
+    last_context: ContextState | None = None
+
+    async def context_usage(self) -> dict[str, Any] | None:
+        """Detailed context breakdown by category, if the agent can report one.
+
+        Distinct from `last_context`, which is free and always current;
+        this makes a real round-trip and is only worth it on demand.
+        """
+        return None
 
     @abstractmethod
     async def start(self) -> None:

@@ -1,5 +1,8 @@
 """Tool approvals via Discord polls.
 
+Which tools skip the poll is held in ApprovalPrefs and edited from the
+`auto-approve` panel; ⚡ there grants everything at once.
+
 request() posts the tool detail, then a poll with Approve/Deny. It waits for the
 owner's vote and denies on timeout so a forgotten prompt can't hang a session.
 If polls can't be sent, it falls back to emoji reactions.
@@ -9,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
-from typing import Any
+from typing import Any, Callable
 
 import discord
 
+from src.approvals import ApprovalPrefs
 from src.render import ask_question_text, permission_embed
 
 _APPROVE = "✅"
@@ -22,9 +26,20 @@ _OTHER = "Other"  # always-present poll choice that lets you type a free answer
 
 
 class DiscordPermissionBroker:
-    def __init__(self, bot: discord.Client, timeout: int):
+    def __init__(
+        self,
+        bot: discord.Client,
+        timeout: int,
+        approvals: ApprovalPrefs | None = None,
+        on_new_tool: Callable[[str], None] | None = None,
+    ):
         self._bot = bot
         self._timeout = timeout
+        # Auto-approval is enforced here rather than through allowed_tools so
+        # it can be changed while sessions are running, and so every call is
+        # seen -- which is how the panel learns tool names it was never told.
+        self.approvals = approvals if approvals is not None else ApprovalPrefs()
+        self._on_new_tool = on_new_tool
         # Channels waiting for a typed "Other" answer. on_message skips
         # forwarding a message here so it becomes the answer, not a new turn.
         self.awaiting_text: set[int] = set()
@@ -35,6 +50,15 @@ class DiscordPermissionBroker:
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> tuple[bool, str | None]:
+        # Recorded even when the answer is automatic, so the panel can offer
+        # this tool by name next time.
+        if self.approvals.note_seen(tool_name) and self._on_new_tool is not None:
+            self._on_new_tool(tool_name)
+        # Checked before anything else: approving requires no channel, so a
+        # channel that cannot be resolved must not turn "never ask" into a
+        # denial that stalls the agent.
+        if self.approvals.allows(tool_name):
+            return True, None
         channel = self._bot.get_channel(channel_id)
         if channel is None or not isinstance(channel, discord.abc.Messageable):
             return False, "No channel available to request approval."

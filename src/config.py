@@ -40,6 +40,10 @@ class Config:
     db_path: str = "sessions.db"
     skills: str | list[str] | None = "all"
     auto_approve_tools: list[str] = field(default_factory=list)
+    #: Context fullness (percent) at which to warn, then warn again. Set
+    #: context_warn_at to 0 to disable the warnings entirely.
+    context_warn_at: int = 75
+    context_warn_again_at: int = 90
 
     @classmethod
     def load(cls, dotenv_path: str = ".env", toml_path: str = "config.toml") -> "Config":
@@ -54,6 +58,7 @@ class Config:
         toml = _read_toml(toml_path)
         bot = toml.get("bot", {})
         tools = toml.get("tools", {})
+        ctx = toml.get("context", {})
 
         model = str(bot.get("model", "")).strip() or None
 
@@ -75,4 +80,6 @@ class Config:
             db_path=str(bot.get("db_path", "sessions.db")) or "sessions.db",
             skills=skills,
             auto_approve_tools=[str(t) for t in tools.get("auto_approve", [])],
+            context_warn_at=int(ctx.get("warn_at", 75)),
+            context_warn_again_at=int(ctx.get("warn_again_at", 90)),
         )

@@ -2,7 +2,11 @@
 
 One row per thread (a thread id is a channel id). The row holds the session id so
 a binding survives restarts; cwd and titles come from the provider's own session
-data, not from here. Stopping a session deletes the row.
+data, not from here.
+
+Stopping a session marks the row 'stopped' rather than deleting it, so the thread
+keeps its session id and a bare `resume` can restart it in place. `forget` is the
+hard delete.
 """
 
 from __future__ import annotations
@@ -20,6 +24,13 @@ class Pin:
     created_at: float
     updated_at: float
     mode: str = "default"
+    #: 'live' while the session is usable, 'stopped' once it has been shut down.
+    #: A stopped row is kept so the thread can be resumed without an id.
+    status: str = "live"
+
+    @property
+    def stopped(self) -> bool:
+        return self.status == "stopped"
 
 
 _SCHEMA = """
@@ -29,7 +40,8 @@ CREATE TABLE IF NOT EXISTS pins (
     session_id TEXT,
     created_at REAL    NOT NULL,
     updated_at REAL    NOT NULL,
-    mode       TEXT    NOT NULL DEFAULT 'default'
+    mode       TEXT    NOT NULL DEFAULT 'default',
+    status     TEXT    NOT NULL DEFAULT 'live'
 );
 """
 
@@ -49,6 +61,10 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE pins ADD COLUMN mode TEXT NOT NULL DEFAULT 'default'"
             )
+        if "status" not in cols:
+            self._conn.execute(
+                "ALTER TABLE pins ADD COLUMN status TEXT NOT NULL DEFAULT 'live'"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -62,6 +78,7 @@ class Store:
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             mode=r["mode"],
+            status=r["status"],
         )
 
     def pin(self, channel_id: int, provider: str, session_id: str | None) -> None:
@@ -73,7 +90,8 @@ class Store:
             ON CONFLICT(channel_id) DO UPDATE SET
                 provider   = excluded.provider,
                 session_id = excluded.session_id,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                status     = 'live'
             """,
             (channel_id, provider, session_id, now, now),
         )
@@ -83,6 +101,14 @@ class Store:
         self._conn.execute(
             "UPDATE pins SET mode = ?, updated_at = ? WHERE channel_id = ?",
             (mode, time.time(), channel_id),
+        )
+        self._conn.commit()
+
+    def set_status(self, channel_id: int, status: str) -> None:
+        """Mark a binding live or stopped without discarding it."""
+        self._conn.execute(
+            "UPDATE pins SET status = ?, updated_at = ? WHERE channel_id = ?",
+            (status, time.time(), channel_id),
         )
         self._conn.commit()
 
@@ -110,5 +136,6 @@ class Store:
         return [self._pin(r) for r in cur.fetchall()]
 
     def unpin(self, channel_id: int) -> None:
+        """Hard-delete a binding. Stopping uses set_status instead."""
         self._conn.execute("DELETE FROM pins WHERE channel_id = ?", (channel_id,))
         self._conn.commit()

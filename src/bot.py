@@ -11,6 +11,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+from src.approvals import ApprovalPrefs, approvals_panel
 from src.config import Config
 from src.forum import (
     create_session_thread,
@@ -24,11 +25,20 @@ from src.paginator import paginate
 from src.permissions import DiscordPermissionBroker
 from src.prefs import DisplayPrefs, view_panel
 from src.providers import claude as claude_provider
-from src.providers.base import Provider
+from src.providers.base import ContextState, Provider
 from src.providers.claude import ClaudeProvider
-from src.render import command_pages, history_embeds, repo_pages, session_pages
+from src.render import (
+    command_pages,
+    context_embed,
+    handoff_embed,
+    history_embeds,
+    repo_pages,
+    session_pages,
+)
+from src.handoff import BRIEF_PROMPT, compose_seed, working_state_async
 from src.session import Session
 from src.store import Store
+from src.context import warn_panel
 
 log = logging.getLogger("src")
 
@@ -84,7 +94,18 @@ class RemoteAgentBot(commands.Bot):
 
         self.config = config
         self.store = Store(config.db_path)
-        self.broker = DiscordPermissionBroker(self, config.approval_timeout)
+        self._approvals_path = str(Path(config.db_path).with_name("approvals.json"))
+        # config.toml's auto_approve seeds the very first run so an existing
+        # setup keeps working; after that the panel owns the list.
+        self.approvals = ApprovalPrefs.load(
+            self._approvals_path, seed=list(config.auto_approve_tools)
+        )
+        self.broker = DiscordPermissionBroker(
+            self,
+            config.approval_timeout,
+            approvals=self.approvals,
+            on_new_tool=lambda _name: self.approvals.save(self._approvals_path),
+        )
         self.sessions: dict[int, Session] = {}
         self.pending_provider: dict[int, str] = {}
         self._tasks: set[asyncio.Task] = set()
@@ -125,7 +146,11 @@ class RemoteAgentBot(commands.Bot):
                 cwd=cwd,
                 channel_id=channel_id,
                 broker=self.broker,
-                allowed_tools=list(self.config.auto_approve_tools),
+                # Deliberately empty: an allowed_tools entry is honoured by
+                # the SDK before can_use_tool runs, so the broker would never
+                # see the call, could not learn the tool's name, and the panel
+                # could not turn it back off. Approval is decided there.
+                allowed_tools=[],
                 skills=self.config.skills,
                 model=self.config.model,
                 resume=resume,
@@ -255,10 +280,16 @@ class RemoteAgentBot(commands.Bot):
         return started
 
     async def do_resume(
-        self, guild: discord.Guild | None, session_id: str, cwd: str | None
+        self,
+        guild: discord.Guild | None,
+        session_id: str | None,
+        cwd: str | None,
+        channel: discord.abc.GuildChannel | None = None,
     ) -> str:
         if guild is None:
             return "Run this in a server."
+        if session_id is None:
+            return await self._resume_here(channel)
         pin = self.store.find_by_session_id(session_id)
         provider_name = pin.provider if pin else self.pending_provider.get(guild.id, "claude")
         work_dir = self._resolve_cwd(cwd) if cwd else claude_provider.session_cwd(session_id)
@@ -310,9 +341,48 @@ class RemoteAgentBot(commands.Bot):
         self._spawn(self._post_history(thread, session_id))
         return f"Resumed in {thread.mention}."
 
-    async def do_stop(self, channel: discord.abc.GuildChannel) -> str:
+    async def _resume_here(self, channel: discord.abc.GuildChannel | None) -> str:
+        """Restart the session this thread is already bound to.
+
+        `stop` leaves the row in place precisely so this works: the thread
+        still knows its session id, so no argument is needed.
+        """
+        if channel is None:
+            return "Run this in a session thread."
+        pin = self.store.get(channel.id)
+        if pin is None or not pin.session_id:
+            return (
+                "No session is bound to this thread. Pass a session id, or "
+                f"use `{self.config.prefix}list` to find one."
+            )
+        if channel.id in self.sessions:
+            return "This session is already running."
+        if isinstance(channel, discord.Thread) and channel.archived:
+            try:
+                await channel.edit(archived=False)
+            except discord.HTTPException as exc:
+                return f"Could not unarchive this thread: `{exc}`"
+        try:
+            session = await self._resume_pin(channel.id)
+        except Exception as exc:
+            return f"Failed to resume: `{exc}`"
+        if session is None:
+            return "Could not resume: that session's data is missing."
+        self.store.set_status(channel.id, "live")
+        return "Resumed this session."
+
+    async def do_stop(self, channel: discord.abc.GuildChannel, forget: bool = False) -> str:
+        """Shut the session down, keeping the binding so it can restart here.
+
+        The row is marked stopped rather than deleted, which is what lets a
+        bare `resume` in this thread pick the same session back up. The thread
+        is archived but deliberately not locked: a locked thread cannot be
+        posted in, so resuming in place would be impossible. `forget` is the
+        hard delete for when you want the binding gone for good.
+        """
         cid = channel.id
-        if self.store.get(cid) is None:
+        pin = self.store.get(cid)
+        if pin is None:
             return "No session here."
         session = self.sessions.pop(cid, None)
         if session is not None:
@@ -320,13 +390,21 @@ class RemoteAgentBot(commands.Bot):
                 await session.stop()
             except Exception as exc:
                 log.warning("Error stopping session: %s", exc)
-        self.store.unpin(cid)
+        if forget:
+            self.store.unpin(cid)
+        else:
+            self.store.set_status(cid, "stopped")
         if isinstance(channel, discord.Thread):
             try:
-                await channel.edit(archived=True, locked=True)
+                await channel.edit(archived=True)
             except discord.HTTPException:
                 pass
-        return "Stopped and archived this session."
+        if forget:
+            return "Stopped and forgot this session. `resume` will not bring it back."
+        return (
+            "Stopped and archived this session. Post `"
+            f"{self.config.prefix}resume` here to start it back up."
+        )
 
     async def do_interrupt(self, channel: discord.abc.GuildChannel) -> str:
         session = self.sessions.get(channel.id)
@@ -386,6 +464,151 @@ class RemoteAgentBot(commands.Bot):
         await provider.start()
         session.provider = provider
 
+    async def handle_context_warning(
+        self,
+        channel: discord.abc.Messageable,
+        session: Session,
+        state: ContextState,
+    ) -> None:
+        """Offer the context actions, then carry out whichever was picked."""
+        action = await warn_panel(self, channel, state, self.config.prefix)
+        if action == "compact":
+            # /compact is the CLI's own in-place summarize; after it the
+            # window is smaller, so the warning should be able to fire again.
+            session.reset_context_warnings()
+            await channel.send("Compacting…")
+            self._spawn(session.handle_message("/compact"))
+        elif action == "handoff":
+            error = await self.do_handoff(channel)
+            if error:
+                await channel.send(error)
+
+    async def do_handoff(self, channel: discord.abc.GuildChannel) -> str | None:
+        """Start a fresh session in a new thread, carrying the work over.
+
+        The outgoing session writes its own brief first: it still has the full
+        context, so nothing else can summarize it as well. That brief, the
+        recent exchange and the repo's actual state become the new session's
+        first message.
+
+        Returns an error to report, or None on success -- success posts its own
+        cross-links, and a caller echoing a reply into the old thread would
+        unarchive the thread this just archived.
+        """
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return "Run this in a server."
+        session = self.sessions.get(channel.id)
+        if session is None:
+            return "No live session here to hand off."
+        pin = self.store.get(channel.id)
+        old_session_id = session.provider.session_id
+        work_dir = getattr(session.provider, "cwd", None) or self.config.launch_cwd
+
+        await channel.send("📝 Asking this session to write a handoff brief…")
+        try:
+            brief = await session.ask(BRIEF_PROMPT)
+        except Exception as exc:
+            return f"Could not get a handoff brief: `{exc}`"
+        if not brief:
+            return "The session returned an empty brief; not handing off."
+
+        history: list[tuple[str, str]] = []
+        if old_session_id:
+            try:
+                history = claude_provider.textual_history(old_session_id)
+            except Exception as exc:
+                log.warning("Could not read history for handoff: %s", exc)
+        state = await working_state_async(work_dir)
+        seed = compose_seed(brief, history, state, old_session_id=old_session_id)
+
+        repo, branch = git_info(work_dir)
+        new_session_id = str(uuid.uuid4())
+        try:
+            thread = await self._open_thread(
+                guild, f"{repo} ({branch}) cont.", new_session_id, work_dir
+            )
+        except discord.Forbidden:
+            return "I need Manage Channels to create the sessions forum."
+        except discord.HTTPException as exc:
+            return f"Could not create the new thread: `{exc}`"
+
+        provider_name = pin.provider if pin else "claude"
+        mode = pin.mode if pin else "default"
+        try:
+            provider = self._make_provider(
+                provider_name,
+                cwd=work_dir,
+                channel_id=thread.id,
+                resume=None,
+                session_id=new_session_id,
+                mode=mode,
+            )
+            await provider.start()
+        except Exception as exc:
+            return f"Could not start the new session: `{exc}`"
+
+        new_session = Session(
+            self, self.store, thread.id, provider, provider_name, pre_named=True
+        )
+        self.sessions[thread.id] = new_session
+        self.store.pin(thread.id, provider_name, new_session_id)
+        if mode != "default":
+            self.store.set_mode(thread.id, mode)
+
+        # Retire the old one only once the new thread is genuinely up, so a
+        # failure above leaves the original session intact and usable.
+        await self._retire_after_handoff(channel, thread)
+        await thread.send(embed=handoff_embed(brief, channel))
+        self._spawn(new_session.handle_message(seed))
+        return None
+
+    async def _retire_after_handoff(
+        self, old: discord.abc.GuildChannel, new: discord.Thread
+    ) -> None:
+        """Stop the outgoing session and point it at its replacement."""
+        session = self.sessions.pop(old.id, None)
+        if session is not None:
+            try:
+                await session.stop()
+            except Exception as exc:
+                log.warning("Error stopping handed-off session: %s", exc)
+        if self.store.get(old.id) is not None:
+            self.store.set_status(old.id, "stopped")
+        try:
+            await old.send(f"↪️ Continued in {new.mention}. This session is stopped.")
+        except discord.HTTPException:
+            pass
+        if isinstance(old, discord.Thread):
+            try:
+                await old.edit(archived=True)
+            except discord.HTTPException:
+                pass
+
+    async def do_context(self, channel: discord.abc.GuildChannel) -> None:
+        """Post the live context breakdown for this thread's session."""
+        session = self.sessions.get(channel.id)
+        if session is None:
+            await channel.send("No live session here. Start or resume one first.")
+            return
+        try:
+            usage = await session.provider.context_usage()
+        except Exception as exc:
+            await channel.send(f"Could not read context usage: `{exc}`")
+            return
+        if not usage:
+            await channel.send("This provider does not report context usage.")
+            return
+        await channel.send(embed=context_embed(usage))
+
+    async def do_approvals(self, channel: discord.abc.Messageable) -> None:
+        self._spawn(
+            approvals_panel(self, channel, self.approvals, self._save_approvals)
+        )
+
+    def _save_approvals(self) -> None:
+        self.approvals.save(self._approvals_path)
+
     async def do_view(self, channel: discord.abc.Messageable) -> None:
         self._spawn(view_panel(self, channel, self.prefs, self._on_pref_change))
 
@@ -418,8 +641,10 @@ class RemoteAgentBot(commands.Bot):
 
     async def do_list(self, channel: discord.abc.Messageable) -> None:
         sessions = claude_provider.recent_sessions(100)
-        pinned = {p.session_id: p.channel_id for p in self.store.list_all() if p.session_id}
-        self._spawn(paginate(self, channel, session_pages(sessions, pinned)))
+        pins = [p for p in self.store.list_all() if p.session_id]
+        pinned = {p.session_id: p.channel_id for p in pins}
+        stopped = {p.session_id for p in pins if p.stopped}
+        self._spawn(paginate(self, channel, session_pages(sessions, pinned, stopped)))
 
     async def do_skills(self, channel: discord.abc.Messageable) -> None:
         session = self.sessions.get(getattr(channel, "id", 0))
@@ -436,15 +661,18 @@ class RemoteAgentBot(commands.Bot):
         rows = [
             ("new [repo:X] [branch:Y] [mode:Z]", "start a session; branch runs in a worktree, mode is default/acceptEdits/auto/plan/bypassPermissions"),
             ("repos", "list repos under the base path with their branches and worktrees"),
-            ("resume <id> [cwd]", "resume a session in a thread"),
+            ("resume [id] [cwd]", "restart this thread's session; with an id, resume that one"),
             ("list", "show resumable sessions"),
             ("skills", "list available skills"),
             ("skill <name> [args]", "run a skill in this session thread"),
             ("mode <name>", "switch permission mode (default, acceptEdits, auto, plan, bypassPermissions)"),
-            ("view", "toggle what shows (thinking, tool calls, tool results)"),
+            ("context", "show how full this session's context window is, and what fills it"),
+            ("handoff", "carry this session into a fresh thread with a brief, recent turns and repo state"),
+            ("auto-approve", "pick which tools run without asking (⚡ approves everything)"),
+            ("view", "toggle what shows (thinking, tool calls, tool results, tasks)"),
             ("provider <name>", "set provider for the next new"),
             ("interrupt", "stop the current turn"),
-            ("stop", "end this session and archive its thread"),
+            ("stop [forget]", "end this session and archive the thread; `forget` drops the binding"),
         ]
         lines = [f"Commands (prefix `{p}`):"]
         lines += [f"`{p}{cmd}` {desc}" for cmd, desc in rows]
@@ -498,9 +726,13 @@ def register_chat(bot: RemoteAgentBot) -> None:
 
     @bot.command(name="resume")
     async def resume_cmd(
-        ctx: commands.Context, session_id: str, cwd: str | None = None
+        ctx: commands.Context, session_id: str | None = None, cwd: str | None = None
     ) -> None:
-        await ctx.channel.send(await bot.do_resume(ctx.guild, session_id, cwd))
+        # No id means "restart whatever this thread was bound to", which is
+        # how a thread that was stopped comes back.
+        await ctx.channel.send(
+            await bot.do_resume(ctx.guild, session_id, cwd, ctx.channel)
+        )
 
     @bot.command(name="list")
     async def list_cmd(ctx: commands.Context) -> None:
@@ -522,6 +754,20 @@ def register_chat(bot: RemoteAgentBot) -> None:
     async def mode_cmd(ctx: commands.Context, mode: str) -> None:
         await ctx.channel.send(await bot.do_mode(ctx.channel, mode))
 
+    @bot.command(name="handoff")
+    async def handoff_cmd(ctx: commands.Context) -> None:
+        error = await bot.do_handoff(ctx.channel)
+        if error:
+            await ctx.channel.send(error)
+
+    @bot.command(name="context")
+    async def context_cmd(ctx: commands.Context) -> None:
+        await bot.do_context(ctx.channel)
+
+    @bot.command(name="auto-approve", aliases=["auto", "approvals"])
+    async def approvals_cmd(ctx: commands.Context) -> None:
+        await bot.do_approvals(ctx.channel)
+
     @bot.command(name="view")
     async def view_cmd(ctx: commands.Context) -> None:
         await bot.do_view(ctx.channel)
@@ -531,8 +777,9 @@ def register_chat(bot: RemoteAgentBot) -> None:
         await ctx.channel.send(await bot.do_interrupt(ctx.channel))
 
     @bot.command(name="stop")
-    async def stop_cmd(ctx: commands.Context) -> None:
-        await ctx.channel.send(await bot.do_stop(ctx.channel))
+    async def stop_cmd(ctx: commands.Context, *, rest: str = "") -> None:
+        forget = rest.strip().lower() in ("forget", "--forget")
+        await ctx.channel.send(await bot.do_stop(ctx.channel, forget=forget))
 
     @bot.command(name="help")
     async def help_cmd(ctx: commands.Context) -> None:

@@ -4,6 +4,7 @@
 *.db-journal
 *.sqlite3
 prefs.json
+approvals.json
 
 # python
 __pycache__/

@@ -213,6 +213,83 @@ def permission_embed(tool_name: str, tool_input: dict) -> discord.Embed:
     return embed
 
 
+def handoff_embed(brief: str, source: object = None) -> discord.Embed:
+    """The carried-over brief, shown in the new thread as a record.
+
+    The agent receives the full brief in its seed message; this is for you, so
+    it is truncated to whatever an embed will hold rather than split.
+    """
+    body = (brief or "").strip()
+    if len(body) > 4000:
+        body = body[:4000] + "\n\n…truncated; the new session received it in full."
+    embed = discord.Embed(
+        title="↪️ Carried over from the previous session",
+        description=body or "_No brief was produced._",
+        color=0x9B59B6,
+    )
+    mention = getattr(source, "mention", None)
+    if mention:
+        embed.set_footer(text="Continued from a session that ran out of context.")
+        embed.add_field(name="Previous thread", value=mention, inline=False)
+    return embed
+
+
+def usage_bar(pct: float, width: int = 20) -> str:
+    """A fixed-width meter, so successive readings line up when scrolling."""
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def context_color(pct: float) -> int:
+    if pct >= 90:
+        return 0xE74C3C
+    if pct >= 75:
+        return 0xE67E22
+    return 0x2ECC71
+
+
+def context_embed(usage: dict) -> discord.Embed:
+    """The `/context` breakdown: how full the window is and what is filling it."""
+    total = int(usage.get("totalTokens") or 0)
+    limit = int(usage.get("maxTokens") or 0)
+    raw = int(usage.get("rawMaxTokens") or 0)
+    pct = float(usage.get("percentage") or 0.0)
+
+    embed = discord.Embed(
+        title="Context window",
+        description=f"`{usage_bar(pct)}` **{pct:.1f}%**\n{total:,} / {limit:,} tokens",
+        color=context_color(pct),
+    )
+
+    # Biggest consumers first -- that is what you act on.
+    cats = [c for c in usage.get("categories") or [] if (c.get("tokens") or 0) > 0]
+    if cats:
+        lines = [
+            f"`{(c.get('tokens') or 0):>8,}`  {c.get('name', '?')}"
+            + ("  _(deferred)_" if c.get("isDeferred") else "")
+            for c in sorted(cats, key=lambda c: c.get("tokens") or 0, reverse=True)
+        ]
+        embed.add_field(name="Breakdown", value="\n".join(lines)[:1024], inline=False)
+
+    files = usage.get("memoryFiles") or []
+    if files:
+        lines = [
+            f"`{(f.get('tokens') or 0):>6,}`  {f.get('path', '?')}" for f in files[:10]
+        ]
+        if len(files) > 10:
+            lines.append(f"…and {len(files) - 10} more")
+        embed.add_field(name="Memory files", value="\n".join(lines)[:1024], inline=False)
+
+    foot = [str(usage.get("model") or "unknown model")]
+    if raw and limit and raw != limit:
+        # The gap is the autocompact buffer, which explains a limit that looks
+        # smaller than the model's advertised window.
+        foot.append(f"window {raw:,}, {raw - limit:,} reserved for autocompact")
+    foot.append("autocompact on" if usage.get("isAutoCompactEnabled") else "autocompact off")
+    embed.set_footer(text=" · ".join(foot))
+    return embed
+
+
 def _field_pages(
     items: list[tuple[str, str]], title: str, per_page: int = 8
 ) -> list[discord.Embed]:
@@ -254,14 +331,30 @@ def repo_pages(repos: list[tuple[str, str, list[tuple[str, str]]]]) -> list[disc
     return _field_pages(items, f"Repos ({len(items)})", per_page=6)
 
 
-def session_pages(sessions: list, pinned: dict[str, int]) -> list[discord.Embed]:
-    """Paginated resumable sessions. `pinned` maps session_id -> channel_id."""
+def session_pages(
+    sessions: list,
+    pinned: dict[str, int],
+    stopped: set[str] | None = None,
+) -> list[discord.Embed]:
+    """Paginated resumable sessions.
+
+    `pinned` maps session_id -> channel_id for every thread-bound session;
+    `stopped` is the subset whose thread is bound but shut down. Those keep a
+    distinct mark, since a stopped session still has a thread to restart in
+    and should not look identical to a live one.
+    """
+    stopped = stopped or set()
     items: list[tuple[str, str]] = []
     for s in sessions:
         sid = getattr(s, "session_id", "")
         title = getattr(s, "custom_title", None) or getattr(s, "summary", None) or "untitled"
         title = " ".join(str(title).split())[:80]
         cwd = getattr(s, "cwd", "") or ""
-        mark = "📌" if sid in pinned else "▫️"
+        if sid in stopped:
+            mark = "⏸️"
+        elif sid in pinned:
+            mark = "📌"
+        else:
+            mark = "▫️"
         items.append((f"{mark} {title}", f"`{sid}`\n{cwd}"))
     return _field_pages(items, f"Resumable sessions ({len(items)})")

@@ -17,5 +17,14 @@ db_path = "sessions.db"
 skills = "all"
 
 [tools]
-# Tools that run without asking. Anything else pops an approval poll.
+# Starting set of tools that run without asking. This only seeds the very
+# first run -- after that the !auto-approve panel owns the list and stores it
+# in approvals.json next to the database. Change it there, not here.
 auto_approve = ["Read", "Glob", "Grep", "NotebookRead", "TodoWrite", "Bash"]
+
+[context]
+# Warn when the session's context window passes this percentage, then again at
+# warn_again_at. The warning offers compact / handoff / ignore. Set warn_at = 0
+# to turn the warnings off.
+warn_at = 75
+warn_again_at = 90
