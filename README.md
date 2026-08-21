@@ -101,6 +101,23 @@ Type them in any channel with the prefix (default `!`).
   binding for good.
 - `!help` list commands
 
+## Tests
+
+```
+make test
+```
+
+Installs anything missing into `.venv` and runs pytest. No Discord connection
+and no API calls — the SDK message types are constructed directly and the
+Discord objects are stubbed, so the suite runs offline in about a second.
+
+What it pins is mostly the non-obvious behaviour that was expensive to get
+right: where a turn ends when a subagent settles before its result frame, that
+the context warning is dispatched outside the session lock (inside it, the
+handoff action deadlocks on its own `ask`), that `acceptEdits` waves through
+edits without consulting the broker, and that an auto-approve toggle follows
+the tool name rather than its row on the page.
+
 ## Context management
 
 A session that fills its context window starts losing the earlier half of the

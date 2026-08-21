@@ -1,4 +1,4 @@
-.PHONY: run install clean
+.PHONY: run install test clean
 
 VENV := .venv
 PY := $(VENV)/bin/python
@@ -13,5 +13,11 @@ install: $(PY)
 run: $(PY)
 	$(PY) run.py
 
+# Installs whatever is missing rather than assuming `make install` has run.
+test: $(PY)
+	@$(PY) -c "import discord" 2>/dev/null || $(MAKE) install
+	@$(PY) -c "import pytest" 2>/dev/null || $(PY) -m pip install -q -r requirements-dev.txt
+	$(PY) -m pytest -q
+
 clean:
-	rm -rf **/__pycache__ __pycache__ *.pyc
+	rm -rf **/__pycache__ __pycache__ *.pyc .pytest_cache
