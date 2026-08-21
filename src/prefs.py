@@ -23,9 +23,10 @@ _TOGGLES = [
     ("🧠", "thinking", "Thinking"),
     ("🔧", "tool_calls", "Tool calls"),
     ("📥", "tool_results", "Tool results"),
+    ("🤖", "tasks", "Task progress"),
 ]
 
-_FIELDS = ("thinking", "tool_calls", "tool_results")
+_FIELDS = ("thinking", "tool_calls", "tool_results", "tasks")
 
 
 @dataclass
@@ -33,6 +34,7 @@ class DisplayPrefs:
     thinking: bool = True
     tool_calls: bool = True
     tool_results: bool = True
+    tasks: bool = True
 
     def shows(self, kind: BlockKind) -> bool:
         """Whether a block of this kind should be rendered. Text, status, and
@@ -43,6 +45,8 @@ class DisplayPrefs:
             return self.tool_calls
         if kind == BlockKind.TOOL_RESULT:
             return self.tool_results
+        if kind == BlockKind.TASK:
+            return self.tasks
         return True
 
     @classmethod

@@ -12,7 +12,7 @@ import json
 
 import discord
 
-from src.providers.base import Block, BlockKind
+from src.providers.base import Block, BlockKind, TaskStatus
 
 _CHUNK = 3800  # leave room for code fences under the 4096 limit
 _CONTENT_LIMIT = 2000  # Discord message content cap
@@ -25,6 +25,13 @@ _STYLE = {
     BlockKind.TOOL_RESULT: ("✅ Result", 0x2ECC71),
     BlockKind.STATUS: ("ℹ️", 0x2B2D31),
     BlockKind.ERROR: ("❌ Error", 0xE74C3C),
+    BlockKind.TASK: ("\U0001f916 Task", 0x9B59B6),
+}
+
+_TASK_STYLE = {
+    TaskStatus.RUNNING: ("\U0001f916", 0x9B59B6),
+    TaskStatus.DONE: ("✅", 0x2ECC71),
+    TaskStatus.FAILED: ("❌", 0xE74C3C),
 }
 
 _CODE_TOOLS = {"Bash"}
@@ -131,6 +138,21 @@ def render_block(block: Block) -> list[dict]:
         else:
             msgs.append({"files": files})
     return msgs
+
+
+def task_embed(block: Block) -> discord.Embed:
+    """One embed for a delegated task's live status message.
+
+    Returns a single embed (not a list of sends) because TaskBoard edits one
+    message in place for the life of the task rather than posting per update.
+    """
+    status = block.task_status or TaskStatus.RUNNING
+    emoji, color = _TASK_STYLE[status]
+    title = f"{emoji} {(block.title or 'Task').strip()}"
+    body = (block.body or "").strip()
+    if status is TaskStatus.RUNNING:
+        body = f"{body}\n_running…_" if body else "_running…_"
+    return discord.Embed(title=title[:256], description=body[:4096], color=color)
 
 
 _HISTORY_COLOR = 0x4E5058

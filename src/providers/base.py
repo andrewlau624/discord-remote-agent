@@ -20,6 +20,23 @@ class BlockKind(str, enum.Enum):
     TOOL_RESULT = "tool_result"
     STATUS = "status"
     ERROR = "error"
+    TASK = "task"
+
+
+class TaskStatus(str, enum.Enum):
+    """Lifecycle of one delegated task (a subagent or a workflow).
+
+    RUNNING blocks update a live message in place; DONE and FAILED are terminal
+    and finalize it.
+    """
+
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self is not TaskStatus.RUNNING
 
 
 @dataclass
@@ -31,6 +48,10 @@ class Block:
     title: str | None = None
     is_error: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
+    #: Set on TASK blocks only: which delegated task this describes. Repeated
+    #: blocks with the same id update one live message instead of stacking up.
+    task_id: str | None = None
+    task_status: TaskStatus | None = None
 
 
 @runtime_checkable
