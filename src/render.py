@@ -319,6 +319,11 @@ def command_pages(commands: list[dict]) -> list[discord.Embed]:
     return _field_pages(items, f"Skills ({len(items)})")
 
 
+def model_pages(models: list[str]) -> list[discord.Embed]:
+    """Paginated model ids for a provider, for the `models` command."""
+    return _field_pages([(m, "") for m in models], f"Models ({len(models)})")
+
+
 def repo_pages(repos: list[tuple[str, str, list[tuple[str, str]]]]) -> list[discord.Embed]:
     """Paginated repos with their checkouts.
 

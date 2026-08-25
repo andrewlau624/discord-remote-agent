@@ -32,6 +32,7 @@ from src.providers import (
     PROVIDERS,
     create_provider,
     modes_for_provider,
+    models_for_provider,
     provider_module,
     recent_sessions,
     session_cwd,
@@ -44,6 +45,7 @@ from src.render import (
     context_embed,
     handoff_embed,
     history_embeds,
+    model_pages,
     repo_pages,
     session_pages,
 )
@@ -157,6 +159,8 @@ class RemoteAgentBot(commands.Bot):
         )
         self.sessions: dict[int, Session] = {}
         self.pending_provider: dict[int, str] = {}
+        #: Per-guild model overrides for new sessions, keyed by provider.
+        self.pending_model: dict[tuple[str, int], str] = {}
         self._tasks: set[asyncio.Task] = set()
         self._prefs_path = str(Path(config.db_path).with_name("prefs.json"))
         self.prefs = DisplayPrefs.load(self._prefs_path)
@@ -189,6 +193,10 @@ class RemoteAgentBot(commands.Bot):
             return override
         return self.pending_provider.get(guild.id, DEFAULT_PROVIDER) if guild else DEFAULT_PROVIDER
 
+    def _model_for_new(self, guild: discord.Guild | None, provider: str) -> str | None:
+        override = self.pending_model.get((provider, guild.id)) if guild else None
+        return override or self.config.provider_models.get(provider)
+
     def _provider_options(self, name: str) -> dict:
         options: dict = {}
         if name == "claude":
@@ -207,13 +215,14 @@ class RemoteAgentBot(commands.Bot):
         resume: str | None,
         session_id: str | None,
         mode: str = "default",
+        model: str | None = None,
     ) -> Any:
         return await create_provider(
             name,
             cwd=cwd,
             channel_id=channel_id,
             broker=self.broker,
-            model=self.config.provider_models.get(name),
+            model=model or self.config.provider_models.get(name),
             resume=resume,
             session_id=session_id,
             mode=mode,
@@ -331,6 +340,7 @@ class RemoteAgentBot(commands.Bot):
                 resume=None,
                 session_id=session_id,
                 mode=mode,
+                model=self._model_for_new(guild, provider_name),
             )
             await provider.start()
         except Exception as exc:
@@ -524,6 +534,45 @@ class RemoteAgentBot(commands.Bot):
         suffix = " (session relaunched)" if relaunched else ""
         return f"Mode set to **{mode}**{suffix}. It sticks across restarts."
 
+    async def do_models(self, channel: discord.abc.Messageable) -> None:
+        guild = getattr(channel, "guild", None)
+        provider = self._provider_for_new(guild)
+        current = self._model_for_new(guild, provider)
+        shown = f"`{current}`" if current else "the provider default"
+        try:
+            fetch = getattr(provider_module(provider), "fetch_models", None)
+            models = [str(m) for m in (await fetch() if fetch else [])]
+        except Exception as exc:
+            log.warning("Could not fetch %s model catalog: %s", provider, exc)
+            models = []
+        if not models:
+            models = list(models_for_provider(provider))
+        status = f"Next **{provider}** session uses {shown}."
+        if not models:
+            status += " No catalog available -- any id the provider accepts works with `model <id>`."
+        pages = model_pages(models)
+        lead = pages[0]
+        lead.description = f"{status}\n\n{lead.description}" if lead.description else status
+        self._spawn(paginate(self, channel, pages))
+
+    async def do_model(self, guild: discord.Guild | None, name: str | None) -> str:
+        if guild is None:
+            return "Run this in a server."
+        provider = self._provider_for_new(guild)
+        key = (provider, guild.id)
+        if name is None or name.lower() in ("clear", "none", "default"):
+            self.pending_model.pop(key, None)
+            configured = self.config.provider_models.get(provider)
+            if configured:
+                return f"Model reset to the configured **{configured}** for new **{provider}** sessions."
+            return f"Model cleared; new **{provider}** sessions use the provider default."
+        chosen = name.strip()
+        self.pending_model[key] = chosen
+        return (
+            f"Model set to **{chosen}** for new **{provider}** sessions. "
+            "Live sessions are unaffected."
+        )
+
     async def _relaunch_with_mode(
         self, channel_id: int, session: Session, mode: str
     ) -> None:
@@ -625,6 +674,7 @@ class RemoteAgentBot(commands.Bot):
                 resume=None,
                 session_id=new_session_id,
                 mode=mode,
+                model=self._model_for_new(guild, provider_name),
             )
             await provider.start()
         except Exception as exc:
@@ -781,6 +831,8 @@ class RemoteAgentBot(commands.Bot):
             ("auto-approve", "pick which tools run without asking (⚡ approves everything)"),
             ("view", "toggle what shows (thinking, tool calls, tool results, tasks)"),
             ("provider <name>", "set provider for the next new (threads open under sessions-claude / sessions-opencode)"),
+            ("models", "list models for the next new session's provider"),
+            ("model <id> | clear", "set the model new sessions use (e.g. sonnet or anthropic/claude-opus-4-6); clear resets"),
             ("login [name]", "log into an Anthropic account from here: open the link, paste back the code"),
             ("accounts", "list saved Anthropic accounts"),
             ("account <name>", "make <name> active for new sessions"),
@@ -893,6 +945,14 @@ def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="mode")
     async def mode_cmd(ctx: commands.Context, mode: str) -> None:
         await ctx.channel.send(await bot.do_mode(ctx.channel, mode))
+
+    @bot.command(name="models")
+    async def models_cmd(ctx: commands.Context) -> None:
+        await bot.do_models(ctx.channel)
+
+    @bot.command(name="model")
+    async def model_cmd(ctx: commands.Context, name: str | None = None) -> None:
+        await ctx.channel.send(await bot.do_model(ctx.guild, name))
 
     @bot.command(name="handoff")
     async def handoff_cmd(ctx: commands.Context) -> None:

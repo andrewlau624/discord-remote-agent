@@ -62,6 +62,10 @@ NAME = "claude"
 #: Permission modes the CLI accepts, in our normalized naming.
 MODES = ("default", "acceptEdits", "auto", "plan", "bypassPermissions")
 
+#: Well-known --model aliases. The CLI also accepts full model ids, which
+#: pass through unvalidated.
+MODELS = ("opus", "sonnet", "haiku")
+
 _SETTING_SOURCES = ["user", "project", "local"]
 
 # Task types whose completion wakes the parent for a follow-up turn, so a

@@ -32,6 +32,10 @@ def modes_for_provider(name: str) -> tuple[str, ...]:
     return tuple(getattr(module(name), "MODES", ()))
 
 
+def models_for_provider(name: str) -> tuple[str, ...]:
+    return tuple(getattr(module(name), "MODELS", ()))
+
+
 async def _maybe(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 

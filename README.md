@@ -45,6 +45,21 @@ agents can read images that way).
    make run
    ```
 
+7. Or run it as a login service so it survives closing the terminal, and
+   auto-restarts if it crashes:
+
+   ```
+   mkdir -p ~/Library/LaunchAgents
+   cp launchd/com.discord-remote-agent.plist ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.discord-remote-agent.plist
+   ```
+
+   Logs land in `~/Library/Logs/discord-remote-agent.log`. Restart with
+   `launchctl kickstart -k gui/$(id -u)/com.discord-remote-agent`; stop with
+   `launchctl bootout gui/$(id -u)/com.discord-remote-agent`. To also keep it
+   running with the MacBook lid closed: `sudo pmset -c disablesleep 1`
+   (revert with `sudo pmset -c disablesleep 0`); keep it plugged in.
+
 ## Anthropic accounts from anywhere
 
 `!login [name]` starts Claude's OAuth login right from Discord: the bot posts

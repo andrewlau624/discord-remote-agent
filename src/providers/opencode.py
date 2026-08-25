@@ -808,6 +808,21 @@ async def fetch_commands(
     return out
 
 
+async def fetch_models() -> list[str]:
+    """Available models as "providerID/modelID", read via a throwaway server."""
+    out: list[str] = []
+    async for client in _probe_servers():
+        try:
+            resp = await client.get("/api/model")
+            items = ((resp.json() or {}).get("data")) or []
+        except (httpx.HTTPError, ValueError):
+            continue
+        for item in items:
+            if isinstance(item, dict) and item.get("id"):
+                out.append(f"{item.get('providerID') or ''}/{item['id']}")
+    return sorted(set(out))
+
+
 async def session_cwd(session_id: str) -> str | None:
     """Resolve where an opencode session lives, via a throwaway server."""
     async for client in _probe_servers():
