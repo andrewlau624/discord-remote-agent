@@ -22,42 +22,57 @@ def usage(**over) -> dict:
 
 
 def test_used_counts_fresh_and_cached_input():
+    request = {
+        "input_tokens": 10_000,
+        "cache_read_input_tokens": 80_000,
+        "cache_creation_input_tokens": 10_000,
+    }
     state = C._context_from_usage(
-        {
-            "opus": usage(
-                inputTokens=10_000,
-                cacheReadInputTokens=80_000,
-                cacheCreationInputTokens=10_000,
-                contextWindow=200_000,
-            )
-        }
+        request, {"opus": usage(contextWindow=200_000)}
     )
     assert state.used == 100_000
     assert state.pct == 50.0
     assert state.remaining == 100_000
 
 
-def test_the_fullest_window_wins_not_the_average():
-    # A subagent on a smaller model must not mask a parent near compaction.
+def test_cumulative_totals_are_never_summed_against_one_window():
+    # model_usage accumulates across the session; summing it against a single
+    # turn's window is what used to report thousands of percent.
+    model_usage = {
+        "opus": usage(
+            inputTokens=500_000,
+            cacheReadInputTokens=4_000_000,
+            contextWindow=200_000,
+        )
+    }
+    state = C._context_from_usage({"input_tokens": 30_000}, model_usage)
+    assert state.used == 30_000
+    assert state.pct == 15.0
+
+
+def test_the_window_comes_from_model_usage_even_when_models_differ():
     state = C._context_from_usage(
-        {
-            "opus": usage(inputTokens=180_000, contextWindow=200_000),
-            "haiku": usage(inputTokens=1_000, contextWindow=200_000),
-        }
+        {"input_tokens": 90_000},
+        {"opus": usage(contextWindow=100_000), "sonnet": usage(contextWindow=200_000)},
     )
-    assert state.pct == 90.0
-    assert state.model == "opus"
+    assert state.limit == 200_000
+    assert state.pct == 45.0
 
 
 def test_missing_or_unusable_usage_reports_nothing():
-    assert C._context_from_usage(None) is None
-    assert C._context_from_usage({}) is None
-    assert C._context_from_usage({"m": usage(inputTokens=5, contextWindow=0)}) is None
+    assert C._context_from_usage(None, None) is None
+    assert C._context_from_usage({}, {}) is None
+    assert C._context_from_usage({"input_tokens": 5}, {"m": usage(contextWindow=0)}) is None
 
 
 def done_block(model_usage):
     p = C.ClaudeProvider.__new__(C.ClaudeProvider)
     p.last_context = None
+    p._request_usage = {
+        "input_tokens": 20_000,
+        "cache_read_input_tokens": 74_000,
+    }
+    p._cost_seen = 0.0
     message = ResultMessage(
         subtype="success",
         duration_ms=1,
@@ -72,16 +87,28 @@ def done_block(model_usage):
 
 
 def test_done_line_carries_the_percentage():
-    p, block = done_block(
-        {"opus": usage(inputTokens=20_000, cacheReadInputTokens=74_000, contextWindow=200_000)}
-    )
+    p, block = done_block({"opus": usage(contextWindow=200_000)})
     assert "47% ctx" in block.body
     assert "$0.0412" in block.body and "3 turn(s)" in block.body
     assert p.last_context.pct == 47.0
 
 
 def test_done_line_omits_the_percentage_when_unknown():
-    p, block = done_block(None)
+    p = C.ClaudeProvider.__new__(C.ClaudeProvider)
+    p.last_context = None
+    p._request_usage = None
+    p._cost_seen = 0.0
+    message = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=3,
+        session_id="s",
+        total_cost_usd=0.0412,
+        model_usage=None,
+    )
+    block = p._done_block(message)
     assert "ctx" not in block.body
     assert p.last_context is None
 

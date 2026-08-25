@@ -79,32 +79,46 @@ class DiscordPermissionBroker:
     async def ask(self, channel_id: int, tool_input: dict[str, Any]) -> str:
         """Turn an AskUserQuestion into one poll per question and feed the
         owner's picks back to the agent as text."""
-        channel = self._bot.get_channel(channel_id)
-        if channel is None or not isinstance(channel, discord.abc.Messageable):
-            return "No channel available to ask the question."
-        guild = getattr(channel, "guild", None)
-        if guild is None:
-            return "Questions only work in a server."
-        owner_id = guild.owner_id
-
         questions = tool_input.get("questions") or []
         if not questions:
             return "No question to answer. Continue with your best judgment."
 
-        parts: list[str] = []
-        for q in questions:
+        picks = await self.ask_structured(channel_id, questions)
+        parts = []
+        for q, labels in zip(questions, picks):
             header = str(q.get("header") or q.get("question") or "Answer").strip()
-            try:
-                picks = await self._answer_poll(channel, owner_id, q)
-            except (discord.HTTPException, TypeError):
-                picks = []
-            parts.append(f"{header}: {', '.join(picks)}" if picks else f"{header}: (no answer)")
+            parts.append(f"{header}: {', '.join(labels)}" if labels else f"{header}: (no answer)")
 
         return (
             "The user answered your question(s):\n"
             + "\n".join(parts)
             + "\nProceed with these selections and do not ask again."
         )
+
+    async def ask_structured(
+        self, channel_id: int, questions: list[dict[str, Any]]
+    ) -> list[list[str]]:
+        """Poll each question and return the chosen labels, one list per question.
+
+        The structured form is what providers that accept label arrays
+        (opencode) need; `ask` wraps it as prose for agents that read text.
+        """
+        channel = self._bot.get_channel(channel_id)
+        if channel is None or not isinstance(channel, discord.abc.Messageable):
+            return [[] for _ in questions]
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return [[] for _ in questions]
+        owner_id = guild.owner_id
+
+        out: list[list[str]] = []
+        for q in questions:
+            try:
+                picks = await self._answer_poll(channel, owner_id, q)
+            except (discord.HTTPException, TypeError):
+                picks = []
+            out.append(picks)
+        return out
 
     async def _answer_poll(
         self, channel: discord.abc.Messageable, owner_id: int, question: dict[str, Any]

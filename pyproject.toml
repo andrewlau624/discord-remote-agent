@@ -1,0 +1,7 @@
+# pytest config only. Runtime deps live in requirements.txt.
+[tool.pytest.ini_options]
+# Tests sit next to the code they cover as <module>_test.py; the tests/
+# directory uses the default test_*.py naming. Both patterns must be listed:
+# setting this option replaces pytest's defaults rather than adding to them,
+# and one pattern alone silently skips the other tree.
+python_files = ["*_test.py", "test_*.py"]

@@ -81,6 +81,8 @@ def provider(messages: list) -> C.ClaudeProvider:
     p._stalled = False
     p.session_id = None
     p.last_context = None
+    p._request_usage = None
+    p._cost_seen = 0.0
     for m in messages:
         p._queue.put_nowait(m)
     return p

@@ -112,6 +112,20 @@ class Provider(ABC):
         """
         return None
 
+    def drain_pending(self, first_wait: float = 0.0) -> AsyncIterator[Block]:
+        """Output that arrived outside any turn's read window.
+
+        Delegated tasks, background shells and continuations can all finish
+        after the turn that started them has been closed out. Without this,
+        their output sits unread until the *next* user message drags it out --
+        the bot appearing to go quiet mid-work. Sessions call this right after
+        a turn ends: `first_wait` seconds are spent waiting for a first block
+        even when nothing is queued yet, then the stream is followed until it
+        goes quiet.
+        """
+        return
+        yield  # noqa: B901 - makes this an async generator
+
     @abstractmethod
     async def start(self) -> None:
         """Connect (and resume, if `session_id` was set before start)."""

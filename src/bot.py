@@ -7,11 +7,15 @@ import logging
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 
 import discord
 from discord.ext import commands
 
 from src.approvals import ApprovalPrefs, approvals_panel
+from src.attachments import collect as collect_attachments
+from src.attachments import compose_note
+from src.auth import AuthStore, LoginManager
 from src.config import Config
 from src.forum import (
     create_session_thread,
@@ -24,9 +28,17 @@ from src.forum import (
 from src.paginator import paginate
 from src.permissions import DiscordPermissionBroker
 from src.prefs import DisplayPrefs, view_panel
-from src.providers import claude as claude_provider
-from src.providers.base import ContextState, Provider
-from src.providers.claude import ClaudeProvider
+from src.providers import (
+    PROVIDERS,
+    create_provider,
+    modes_for_provider,
+    provider_module,
+    recent_sessions,
+    session_cwd,
+    session_title,
+    textual_history,
+)
+from src.providers.base import ContextState
 from src.render import (
     command_pages,
     context_embed,
@@ -42,11 +54,10 @@ from src.context import warn_panel
 
 log = logging.getLogger("src")
 
-SUPPORTED_PROVIDERS = ("claude",)
+DEFAULT_PROVIDER = "claude"
 
-# Permission modes exposed as choices, plus friendly aliases.
-# "auto" is its own mode (a classifier approves each call), not an alias.
-MODES = ("default", "acceptEdits", "auto", "plan", "bypassPermissions")
+# Permission mode aliases shared by parsing and switching. Each provider
+# accepts its own subset -- see src/providers.
 MODE_ALIASES = {
     "edit": "acceptEdits",
     "edits": "acceptEdits",
@@ -55,32 +66,70 @@ MODE_ALIASES = {
 }
 
 
-def _parse_new_args(text: str) -> tuple[str | None, str | None, str | None, str | None]:
-    """Parse `new` arguments into (repo, branch, mode, error).
+def canonical_mode(mode: str | None) -> str | None:
+    if not mode:
+        return None
+    return MODE_ALIASES.get(mode.lower(), mode)
 
-    Accepts key:value tokens (repo: branch: mode:) in any order. A bare first
-    token is the repo; a bare mode name also works, so `new myrepo bypass`
-    still does what it looks like."""
-    repo = branch = mode = None
+
+async def provider_session_cwd(provider: str, session_id: str) -> str | None:
+    """A session's working directory from the provider's own records."""
+    try:
+        return await session_cwd(provider, session_id)
+    except Exception as exc:
+        log.warning("Could not resolve cwd for %s session %s: %s", provider, session_id, exc)
+        return None
+
+
+async def provider_session_title(provider: str, session_id: str) -> str | None:
+    """A session's title from the provider's own records."""
+    try:
+        return await session_title(provider, session_id)
+    except Exception as exc:
+        log.warning("Could not resolve title for %s session %s: %s", provider, session_id, exc)
+        return None
+
+
+def _parse_new_args(
+    text: str,
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """Parse `new` arguments into (repo, branch, mode, provider, error).
+
+    Accepts key:value tokens (repo: branch: mode: provider:) in any order. A
+    bare first token is the repo; a bare mode name also works, so
+    `new myrepo bypass` still does what it looks like."""
+    repo = branch = mode = provider = None
+    known_modes: set[str] = set()
+    for name in PROVIDERS:
+        try:
+            known_modes.update(modes_for_provider(name))
+        except Exception:
+            continue
     for tok in text.split():
         key, sep, val = tok.partition(":")
-        if sep and key.lower() in ("repo", "branch", "mode"):
+        if sep and key.lower() in ("repo", "branch", "mode", "provider"):
             if key.lower() == "repo":
                 repo = val or None
             elif key.lower() == "branch":
                 branch = val or None
+            elif key.lower() == "provider":
+                provider = val.lower() or None
+                if provider not in PROVIDERS:
+                    return None, None, None, None, (
+                        f"Unknown provider `{val}`. Options: {', '.join(PROVIDERS)}."
+                    )
             else:
-                mode = val or None
-        elif repo is None and MODE_ALIASES.get(tok.lower(), tok) not in (*MODES, "dontAsk"):
+                mode = canonical_mode(val) or None
+        elif repo is None and canonical_mode(tok) not in known_modes:
             repo = tok
-        elif mode is None and MODE_ALIASES.get(tok.lower(), tok) in (*MODES, "dontAsk"):
-            mode = tok
+        elif mode is None and canonical_mode(tok) in known_modes:
+            mode = canonical_mode(tok)
         else:
-            return None, None, None, (
+            return None, None, None, None, (
                 f"Unrecognized argument `{tok}`. "
-                "Use `new [repo:<name>] [branch:<branch>] [mode:<mode>]`."
+                "Use `new [repo:<name>] [branch:<branch>] [mode:<mode>] [provider:<name>]`."
             )
-    return repo, branch, mode, None
+    return repo, branch, mode, provider, None
 
 
 class RemoteAgentBot(commands.Bot):
@@ -111,6 +160,10 @@ class RemoteAgentBot(commands.Bot):
         self._tasks: set[asyncio.Task] = set()
         self._prefs_path = str(Path(config.db_path).with_name("prefs.json"))
         self.prefs = DisplayPrefs.load(self._prefs_path)
+        # Named Anthropic accounts for remote login/switching; the active
+        # token is injected into newly launched Claude sessions.
+        self.auth = AuthStore.load(str(Path(config.db_path).with_name("auth.json")))
+        self.login = LoginManager(self.auth)
 
     async def setup_hook(self) -> None:
         register_chat(self)
@@ -131,7 +184,21 @@ class RemoteAgentBot(commands.Bot):
 
     # ---- providers -------------------------------------------------------
 
-    def _make_provider(
+    def _provider_for_new(self, guild: discord.Guild | None, override: str | None = None) -> str:
+        if override:
+            return override
+        return self.pending_provider.get(guild.id, DEFAULT_PROVIDER) if guild else DEFAULT_PROVIDER
+
+    def _provider_options(self, name: str) -> dict:
+        options: dict = {}
+        if name == "claude":
+            options["skills"] = self.config.skills
+            token = getattr(self.auth, "token", None)
+            if token:
+                options["anthropic_token"] = token
+        return options
+
+    async def _make_provider(
         self,
         name: str,
         *,
@@ -140,31 +207,25 @@ class RemoteAgentBot(commands.Bot):
         resume: str | None,
         session_id: str | None,
         mode: str = "default",
-    ) -> Provider:
-        if name == "claude":
-            return ClaudeProvider(
-                cwd=cwd,
-                channel_id=channel_id,
-                broker=self.broker,
-                # Deliberately empty: an allowed_tools entry is honoured by
-                # the SDK before can_use_tool runs, so the broker would never
-                # see the call, could not learn the tool's name, and the panel
-                # could not turn it back off. Approval is decided there.
-                allowed_tools=[],
-                skills=self.config.skills,
-                model=self.config.model,
-                resume=resume,
-                session_id=session_id,
-                permission_mode=mode,
-            )
-        raise ValueError(f"Provider '{name}' is not implemented yet.")
+    ) -> Any:
+        return await create_provider(
+            name,
+            cwd=cwd,
+            channel_id=channel_id,
+            broker=self.broker,
+            model=self.config.provider_models.get(name),
+            resume=resume,
+            session_id=session_id,
+            mode=mode,
+            options=self._provider_options(name),
+        )
 
     async def _resume_pin(self, channel_id: int) -> Session | None:
         pin = self.store.get(channel_id)
         if pin is None or not pin.session_id:
             return None
-        cwd = claude_provider.session_cwd(pin.session_id) or self.config.launch_cwd
-        provider = self._make_provider(
+        cwd = await provider_session_cwd(pin.provider, pin.session_id) or self.config.launch_cwd
+        provider = await self._make_provider(
             pin.provider,
             cwd=cwd,
             channel_id=channel_id,
@@ -197,15 +258,16 @@ class RemoteAgentBot(commands.Bot):
         return os.path.join(base, path)
 
     async def _open_thread(
-        self, guild: discord.Guild, name: str, session_id: str, cwd: str
+        self, guild: discord.Guild, name: str, session_id: str, cwd: str,
+        provider: str = DEFAULT_PROVIDER,
     ) -> discord.Thread:
-        forum = await ensure_forum(guild)
-        return await create_session_thread(forum, name, session_id, cwd)
+        forum = await ensure_forum(guild, provider)
+        return await create_session_thread(forum, name, session_id, cwd, provider)
 
-    async def _post_history(self, thread: discord.Thread, session_id: str) -> None:
+    async def _post_history(self, thread: discord.Thread, session_id: str, provider: str) -> None:
         """Replay prior textual conversation into a freshly opened thread."""
         try:
-            history = claude_provider.textual_history(session_id)
+            history = await textual_history(provider, session_id)
         except Exception as exc:
             log.warning("Could not load history: %s", exc)
             return
@@ -222,13 +284,20 @@ class RemoteAgentBot(commands.Bot):
         cwd: str | None,
         mode: str | None = None,
         branch: str | None = None,
+        provider_override: str | None = None,
     ) -> str:
         if guild is None:
             return "Run this in a server."
-        mode = MODE_ALIASES.get(mode.lower(), mode) if mode else "default"
-        if mode not in (*MODES, "dontAsk"):
-            return f"Unknown mode. Options: {', '.join(MODES)}."
-        provider_name = self.pending_provider.get(guild.id, "claude")
+        mode = canonical_mode(mode)
+        provider_name = self._provider_for_new(guild, provider_override)
+        allowed_modes = modes_for_provider(provider_name)
+        if not mode:
+            mode = "default"
+        if mode not in allowed_modes:
+            return (
+                f"`{provider_name}` does not support mode `{mode}`. "
+                f"Options: {', '.join(allowed_modes)}."
+            )
         work_dir = self._resolve_cwd(cwd)
         if not os.path.isdir(work_dir):
             return f"`{work_dir}` is not a directory."
@@ -247,7 +316,7 @@ class RemoteAgentBot(commands.Bot):
         repo, branch = git_info(work_dir)
         try:
             thread = await self._open_thread(
-                guild, f"{repo} ({branch})", session_id, work_dir
+                guild, f"{repo} ({branch})", session_id, work_dir, provider_name
             )
         except discord.Forbidden:
             return "I need Manage Channels to create the sessions forum."
@@ -255,7 +324,7 @@ class RemoteAgentBot(commands.Bot):
             return f"Could not create the session thread: `{exc}`"
 
         try:
-            provider = self._make_provider(
+            provider = await self._make_provider(
                 provider_name,
                 cwd=work_dir,
                 channel_id=thread.id,
@@ -291,8 +360,12 @@ class RemoteAgentBot(commands.Bot):
         if session_id is None:
             return await self._resume_here(channel)
         pin = self.store.find_by_session_id(session_id)
-        provider_name = pin.provider if pin else self.pending_provider.get(guild.id, "claude")
-        work_dir = self._resolve_cwd(cwd) if cwd else claude_provider.session_cwd(session_id)
+        provider_name = pin.provider if pin else self._provider_for_new(guild)
+        work_dir = cwd
+        if work_dir:
+            work_dir = self._resolve_cwd(work_dir)
+        else:
+            work_dir = await provider_session_cwd(provider_name, session_id)
         if not work_dir or not os.path.isdir(work_dir):
             return "Could not find that session's directory. Pass a cwd."
 
@@ -310,16 +383,17 @@ class RemoteAgentBot(commands.Bot):
                     return f"Failed to resume: `{exc}`"
                 return f"Resumed in {existing.mention}."
 
-        name = claude_provider.session_title(session_id) or "{} ({})".format(*git_info(work_dir))
+        title = await provider_session_title(provider_name, session_id)
+        name = title or "{} ({})".format(*git_info(work_dir))
         try:
-            thread = await self._open_thread(guild, name, session_id, work_dir)
+            thread = await self._open_thread(guild, name, session_id, work_dir, provider_name)
         except discord.Forbidden:
             return "I need Manage Channels to create the sessions forum."
         except discord.HTTPException as exc:
             return f"Could not create the session thread: `{exc}`"
 
         try:
-            provider = self._make_provider(
+            provider = await self._make_provider(
                 provider_name,
                 cwd=work_dir,
                 channel_id=thread.id,
@@ -338,7 +412,7 @@ class RemoteAgentBot(commands.Bot):
         self.store.pin(thread.id, provider_name, session_id)
         if pin and pin.mode != "default":
             self.store.set_mode(thread.id, pin.mode)
-        self._spawn(self._post_history(thread, session_id))
+        self._spawn(self._post_history(thread, session_id, provider_name))
         return f"Resumed in {thread.mention}."
 
     async def _resume_here(self, channel: discord.abc.GuildChannel | None) -> str:
@@ -416,18 +490,25 @@ class RemoteAgentBot(commands.Bot):
     async def do_provider(self, guild: discord.Guild | None, name: str) -> str:
         if guild is None:
             return "Run this in a server."
-        if name not in SUPPORTED_PROVIDERS:
-            return f"Unknown provider. Options: {', '.join(SUPPORTED_PROVIDERS)}."
+        name = name.lower()
+        if name not in PROVIDERS:
+            return f"Unknown provider. Options: {', '.join(PROVIDERS)}."
         self.pending_provider[guild.id] = name
         return f"Provider set to **{name}** for the next new session."
 
     async def do_mode(self, channel: discord.abc.GuildChannel, mode: str) -> str:
-        mode = MODE_ALIASES.get(mode.lower(), mode)
-        if mode not in (*MODES, "dontAsk"):
-            return f"Unknown mode. Options: {', '.join(MODES)}."
+        mode = canonical_mode(mode)
+        if mode is None:
+            return "Pass a mode to switch to."
         session = self.sessions.get(channel.id) or await self._resume_pin(channel.id)
         if session is None:
             return "No session here. Run this in a session thread."
+        allowed = modes_for_provider(session.provider_name)
+        if mode not in allowed:
+            return (
+                f"`{session.provider_name}` does not support mode `{mode}`. "
+                f"Options: {', '.join(allowed)}."
+            )
         relaunched = False
         try:
             if mode == "bypassPermissions":
@@ -453,7 +534,7 @@ class RemoteAgentBot(commands.Bot):
             raise RuntimeError("No session id to resume with yet. Send a message first.")
         cwd = getattr(old, "cwd", None) or self.config.launch_cwd
         await old.stop()
-        provider = self._make_provider(
+        provider = await self._make_provider(
             session.provider_name,
             cwd=cwd,
             channel_id=channel_id,
@@ -516,7 +597,7 @@ class RemoteAgentBot(commands.Bot):
         history: list[tuple[str, str]] = []
         if old_session_id:
             try:
-                history = claude_provider.textual_history(old_session_id)
+                history = await textual_history(session.provider_name, old_session_id)
             except Exception as exc:
                 log.warning("Could not read history for handoff: %s", exc)
         state = await working_state_async(work_dir)
@@ -526,17 +607,18 @@ class RemoteAgentBot(commands.Bot):
         new_session_id = str(uuid.uuid4())
         try:
             thread = await self._open_thread(
-                guild, f"{repo} ({branch}) cont.", new_session_id, work_dir
+                guild, f"{repo} ({branch}) cont.", new_session_id, work_dir,
+                session.provider_name,
             )
         except discord.Forbidden:
             return "I need Manage Channels to create the sessions forum."
         except discord.HTTPException as exc:
             return f"Could not create the new thread: `{exc}`"
 
-        provider_name = pin.provider if pin else "claude"
+        provider_name = pin.provider if pin else session.provider_name
         mode = pin.mode if pin else "default"
         try:
-            provider = self._make_provider(
+            provider = await self._make_provider(
                 provider_name,
                 cwd=work_dir,
                 channel_id=thread.id,
@@ -640,37 +722,69 @@ class RemoteAgentBot(commands.Bot):
         self._spawn(paginate(self, channel, repo_pages(repos)))
 
     async def do_list(self, channel: discord.abc.Messageable) -> None:
-        sessions = claude_provider.recent_sessions(100)
+        """Resumable sessions across every provider, tagged by origin."""
         pins = [p for p in self.store.list_all() if p.session_id]
-        pinned = {p.session_id: p.channel_id for p in pins}
-        stopped = {p.session_id for p in pins if p.stopped}
-        self._spawn(paginate(self, channel, session_pages(sessions, pinned, stopped)))
+        pinned: dict[str, int] = {}
+        stopped: set[str] = set()
+        for p in pins:
+            pinned[p.session_id] = p.channel_id
+            if p.stopped:
+                stopped.add(p.session_id)
+        pages: list[discord.Embed] = []
+        for name in PROVIDERS:
+            try:
+                sessions = await recent_sessions(name, 100)
+            except Exception as exc:
+                log.warning("Could not list %s sessions: %s", name, exc)
+                continue
+            if not sessions:
+                continue
+            pages.extend(session_pages(sessions, pinned, stopped))
+        if not pages:
+            pages = [discord.Embed(title="Resumable sessions", description="Nothing to show.", color=0x5865F2)]
+        self._spawn(paginate(self, channel, pages))
 
     async def do_skills(self, channel: discord.abc.Messageable) -> None:
-        session = self.sessions.get(getattr(channel, "id", 0))
+        cid = getattr(channel, "id", 0)
+        session = self.sessions.get(cid)
         if session is not None:
             cmds = await session.provider.list_commands()
         else:
-            cmds = await claude_provider.fetch_commands(
-                self.config.launch_cwd, skills=self.config.skills, model=self.config.model
+            # No live session here; show what the pending provider offers.
+            name = self.pending_provider.get(
+                getattr(getattr(channel, "guild", None), "id", 0), DEFAULT_PROVIDER
             )
+            try:
+                mod = provider_module(name)
+                cmds = await mod.fetch_commands(
+                    self.config.launch_cwd,
+                    skills=self.config.skills,
+                    model=self.config.provider_models.get(name),
+                )
+            except Exception as exc:
+                await channel.send(f"Could not list skills for **{name}**: `{exc}`")
+                return
         self._spawn(paginate(self, channel, command_pages(cmds)))
 
     def help_text(self) -> str:
         p = self.config.prefix
         rows = [
-            ("new [repo:X] [branch:Y] [mode:Z]", "start a session; branch runs in a worktree, mode is default/acceptEdits/auto/plan/bypassPermissions"),
+            ("new [repo:X] [branch:Y] [mode:Z] [provider:P]", "start a session; branch runs in a worktree; mode is provider-specific (claude: default/acceptEdits/auto/plan/bypassPermissions, opencode: default/acceptEdits/plan); thread opens under sessions-<provider>"),
             ("repos", "list repos under the base path with their branches and worktrees"),
             ("resume [id] [cwd]", "restart this thread's session; with an id, resume that one"),
-            ("list", "show resumable sessions"),
+            ("list", "show resumable sessions across providers"),
             ("skills", "list available skills"),
             ("skill <name> [args]", "run a skill in this session thread"),
-            ("mode <name>", "switch permission mode (default, acceptEdits, auto, plan, bypassPermissions)"),
+            ("mode <name>", "switch permission mode (per provider, see new)"),
             ("context", "show how full this session's context window is, and what fills it"),
             ("handoff", "carry this session into a fresh thread with a brief, recent turns and repo state"),
             ("auto-approve", "pick which tools run without asking (⚡ approves everything)"),
             ("view", "toggle what shows (thinking, tool calls, tool results, tasks)"),
-            ("provider <name>", "set provider for the next new"),
+            ("provider <name>", "set provider for the next new (threads open under sessions-claude / sessions-opencode)"),
+            ("login [name]", "log into an Anthropic account from here: open the link, paste back the code"),
+            ("accounts", "list saved Anthropic accounts"),
+            ("account <name>", "make <name> active for new sessions"),
+            ("logout <name>", "forget a saved account"),
             ("interrupt", "stop the current turn"),
             ("stop [forget]", "end this session and archive the thread; `forget` drops the binding"),
         ]
@@ -680,10 +794,28 @@ class RemoteAgentBot(commands.Bot):
 
     # ---- message forwarding ---------------------------------------------
 
+    async def on_command_error(self, ctx: commands.Context, error: Exception) -> None:
+        """Override the default handler so errors land in chat, not stderr."""
+        if isinstance(error, commands.CommandNotFound):
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.channel.send(f"Missing argument: {error.param.name}")
+            return
+        await ctx.channel.send(f"Command error: `{error}`")
+
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
             return
         if not self._is_server_owner(message.author.id, message.guild):
+            return
+        # A login code reply is consumed by the login flow, not a turn --
+        # unless it is a command, so `cancel-login` stays reachable.
+        if (
+            self.login.waiting_channel == message.channel.id
+            and not message.content.startswith(self.config.prefix)
+        ):
+            result = await self.login.submit(message.content)
+            await message.channel.send(result)
             return
         # A pending "Other" answer is captured by the broker, not a new turn.
         if message.channel.id in self.broker.awaiting_text:
@@ -691,8 +823,6 @@ class RemoteAgentBot(commands.Bot):
         content = message.content
         if content.startswith(self.config.prefix):
             await self.process_commands(message)
-            return
-        if not content.strip():
             return
         session = self.sessions.get(message.channel.id)
         if session is None:
@@ -703,7 +833,15 @@ class RemoteAgentBot(commands.Bot):
                 return
         if session is None:
             return
-        await session.handle_message(content)
+
+        note = ""
+        if message.attachments:
+            saved = await collect_attachments(message)
+            note = compose_note(saved)
+        text = "\n\n".join(part for part in (content.strip(), note) if part)
+        if not text.strip():
+            return
+        await session.handle_message(text)
 
 
 # ---------------------------------------------------------------------------
@@ -714,11 +852,13 @@ class RemoteAgentBot(commands.Bot):
 def register_chat(bot: RemoteAgentBot) -> None:
     @bot.command(name="new")
     async def new_cmd(ctx: commands.Context, *, rest: str = "") -> None:
-        repo, branch, mode, err = _parse_new_args(rest)
+        repo, branch, mode, provider, err = _parse_new_args(rest)
         if err:
             await ctx.channel.send(err)
             return
-        await ctx.channel.send(await bot.do_new(ctx.guild, repo, mode, branch))
+        await ctx.channel.send(
+            await bot.do_new(ctx.guild, repo, mode, branch, provider)
+        )
 
     @bot.command(name="repos")
     async def repos_cmd(ctx: commands.Context) -> None:
@@ -781,19 +921,60 @@ def register_chat(bot: RemoteAgentBot) -> None:
         forget = rest.strip().lower() in ("forget", "--forget")
         await ctx.channel.send(await bot.do_stop(ctx.channel, forget=forget))
 
+    @bot.command(name="login", aliases=["signin"])
+    async def login_cmd(ctx: commands.Context, name: str | None = None) -> None:
+        """Start a Claude subscription login; paste back the code it gives."""
+        if ctx.guild is None or not bot._is_server_owner(ctx.author.id, ctx.guild):
+            return
+        account = (name or f"account-{len(bot.auth.accounts) + 1}").strip()
+        try:
+            url = await bot.login.start(ctx.channel.id, account)
+        except RuntimeError as exc:
+            await ctx.channel.send(f"Login failed to start: `{exc}`")
+            return
+        await ctx.channel.send(
+            f"**Logging in as `{account}`**\n"
+            f"1. Open this link and approve access: {url}\n"
+            "2. Copy the code it shows you and paste it here."
+        )
+
+    @bot.command(name="cancel-login")
+    async def cancel_login_cmd(ctx: commands.Context) -> None:
+        await bot.login.cancel()
+        await ctx.channel.send("Login cancelled.")
+
+    @bot.command(name="accounts")
+    async def accounts_cmd(ctx: commands.Context) -> None:
+        auth = bot.auth
+        if not auth.accounts:
+            await ctx.channel.send("No saved accounts. Use `login [name]` first.")
+            return
+        lines = [
+            ("👉 " if name == auth.active else "   ") + f"`{name}`"
+            for name in sorted(auth.accounts)
+        ]
+        await ctx.channel.send(
+            "**Anthropic accounts** (👉 active for new sessions)\n" + "\n".join(lines)
+        )
+
+    @bot.command(name="account")
+    async def account_cmd(ctx: commands.Context, name: str) -> None:
+        if bot.auth.switch(name):
+            await ctx.channel.send(f"New sessions will use **{name}**.")
+        else:
+            known = ", ".join(sorted(bot.auth.accounts)) or "none saved"
+            await ctx.channel.send(f"No account named `{name}`. Known: {known}.")
+
+    @bot.command(name="logout")
+    async def logout_cmd(ctx: commands.Context, name: str) -> None:
+        if bot.auth.forget(name):
+            await ctx.channel.send(f"Forgot **{name}**. Running sessions are unaffected.")
+        else:
+            await ctx.channel.send(f"No account named `{name}`.")
+
     @bot.command(name="help")
     async def help_cmd(ctx: commands.Context) -> None:
         await ctx.channel.send(bot.help_text())
-
-    async def on_command_error(ctx: commands.Context, error: Exception) -> None:
-        if isinstance(error, commands.CommandNotFound):
-            return
-        if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.channel.send(f"Missing argument: {error.param.name}")
-            return
-        await ctx.channel.send(f"Command error: `{error}`")
-
-    bot.add_listener(on_command_error)
 
 
 def run(config: Config) -> None:

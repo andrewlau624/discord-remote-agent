@@ -40,6 +40,9 @@ class Config:
     db_path: str = "sessions.db"
     skills: str | list[str] | None = "all"
     auto_approve_tools: list[str] = field(default_factory=list)
+    #: Per-provider settings from [providers.<name>] tables. Only `model` is
+    # read today: [providers.opencode] model = "anthropic/claude-opus-4-6".
+    provider_models: dict[str, str | None] = field(default_factory=dict)
     #: Context fullness (percent) at which to warn, then warn again. Set
     #: context_warn_at to 0 to disable the warnings entirely.
     context_warn_at: int = 75
@@ -70,6 +73,11 @@ class Config:
         else:
             skills = "all"
 
+        provider_models: dict[str, str | None] = {}
+        for name, table in (toml.get("providers") or {}).items():
+            if isinstance(table, dict) and str(table.get("model", "")).strip():
+                provider_models[str(name)] = str(table["model"]).strip()
+
         return cls(
             token=token,
             launch_cwd=os.getcwd(),
@@ -80,6 +88,7 @@ class Config:
             db_path=str(bot.get("db_path", "sessions.db")) or "sessions.db",
             skills=skills,
             auto_approve_tools=[str(t) for t in tools.get("auto_approve", [])],
+            provider_models=provider_models,
             context_warn_at=int(ctx.get("warn_at", 75)),
             context_warn_again_at=int(ctx.get("warn_again_at", 90)),
         )

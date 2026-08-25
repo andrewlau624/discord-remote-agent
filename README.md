@@ -7,23 +7,31 @@ server becomes the interface. Each session is a forum post, the agent's output
 shows up as blocks (thinking, tool calls, tool results, text), and anything that
 could change your files waits for you to vote Approve or Deny.
 
-Currently, Claude is the only supported provider.
+Providers are pluggable and normalized: **claude** (via the Claude Agent SDK)
+and **opencode** (via a per-session `opencode serve` instance) ship today, and
+each gets its own forum — `sessions-claude`, `sessions-opencode`. Commands like
+`!mode`, `!context`, `!list` and `!handoff` work the same against either.
+
+Send files with your message: small text files are inlined into the prompt,
+images and other files are saved to disk and handed to the agent by path (both
+agents can read images that way).
 
 ## Setup
 
 1. Install Claude Code and sign in. The SDK shells out to it.
-2. Install deps:
+2. Install [opencode](https://opencode.ai) if you want the opencode provider.
+3. Install deps:
 
    ```
    make install
    ```
 
-3. Make a Discord app and bot at https://discord.com/developers/applications.
+4. Make a Discord app and bot at https://discord.com/developers/applications.
    Under Bot, turn on the Message Content Intent. Invite it with the `bot` scope
-   and give it Manage Channels (to create the sessions forum), Manage Messages
+   and give it Manage Channels (to create the sessions forums), Manage Messages
    (to clear page reactions), plus Send Messages, Create Posts, and Send Messages
    in Threads.
-4. Copy the env file and set your token:
+5. Copy the env file and set your token:
 
    ```
    cp .env.example .env
@@ -31,11 +39,20 @@ Currently, Claude is the only supported provider.
 
    Set `DISCORD_TOKEN`. Only the server owner can use the bot, so there is no
    allowlist to configure.
-5. Run it:
+6. Run it:
 
    ```
    make run
    ```
+
+## Anthropic accounts from anywhere
+
+`!login [name]` starts Claude's OAuth login right from Discord: the bot posts
+the authorize link, you open it on any device, approve, and paste the code back
+into the thread. The long-lived token is saved under `name` in `auth.json`
+(gitignored, mode 0600) and becomes the account new sessions use. Keep several
+accounts around and flip between them with `!account <name>`; `!logout <name>`
+forgets one. Running sessions are unaffected until restarted.
 
 ## Config
 
@@ -43,6 +60,7 @@ Secrets live in `.env`. Everything else is in `config.toml`:
 
 - `prefix` for commands (default `!`)
 - `model` for Claude Code (blank uses the default)
+- `providers.opencode.model`, e.g. `"anthropic/claude-opus-4-6"` (blank uses opencode's default)
 - `default_cwd`, the base path for new sessions (blank uses the launch dir)
 - `approval_timeout` in seconds
 - `db_path` for the pin database
@@ -56,40 +74,41 @@ Secrets live in `.env`. Everything else is in `config.toml`:
 
 Type them in any channel with the prefix (default `!`).
 
-- `!new [repo:<name>] [branch:<branch>] [mode:<mode>]` start a session, opens a
-  thread. A repo name resolves under `default_cwd`, or pass a full path. A bare
-  first argument is the repo, so `!new myrepo` still works. `branch:` runs the
-  session in a git worktree for that branch (reused if one exists, created
-  under `<repo>/.worktrees/` if not, branch created on demand). Gitignored
-  `.env*` files are carried over from the main checkout, existing files are
-  never overwritten. `mode:` starts
-  in that permission mode; `mode:bypassPermissions` at launch is the only way
-  to get bypass, the CLI refuses to switch into it later.
+- `!new [repo:<name>] [branch:<branch>] [mode:<mode>] [provider:<name>]` start a
+  session, opens a thread under `sessions-<provider>`. A repo name resolves
+  under `default_cwd`, or pass a full path. A bare first argument is the repo,
+  so `!new myrepo` still works. `branch:` runs the session in a git worktree for
+  that branch (reused if one exists, created under `<repo>/.worktrees/` if not,
+  branch created on demand). Gitignored `.env*` files are carried over from the
+  main checkout, existing files are never overwritten. `mode:` starts in that
+  permission mode; modes are provider-specific — claude supports
+  `default/acceptEdits/auto/plan/bypassPermissions`, opencode supports
+  `default/acceptEdits/plan`.
 - `!repos` list repos under the base path with their branches and existing
   worktrees, so you can reuse instead of creating new ones
 - `!resume [session_id] [cwd]` with no argument, restart the session this
   thread is already bound to — that is how a thread stopped with `!stop` comes
   back. With an id, resume that session (in its existing thread if it still
   has one, otherwise a new one).
-- `!list` show resumable sessions (paged): 📌 open, ⏸️ stopped but still bound
-  to a thread, ▫️ unbound
+- `!list` show resumable sessions across all providers (paged): 📌 open,
+  ⏸️ stopped but still bound to a thread, ▫️ unbound
 - `!provider <name>` pick the provider for the next `!new`
+- `!login [name]` / `!accounts` / `!account <name>` / `!logout <name>` manage
+  Anthropic accounts remotely — see above
 - `!skills` list available skills and commands (paged)
 - `!skill <name> [args]` run a skill in this session
-- `!mode <name>` switch permission mode: `default`, `acceptEdits`, `auto`,
-  `plan`, `bypassPermissions`. The mode is saved per thread and survives bot
-  restarts. Switching to `bypassPermissions` relaunches the session, since the
-  CLI only honors bypass at launch.
+- `!mode <name>` switch permission mode; validated against the thread's
+  provider and saved across restarts. Switching to `bypassPermissions`
+  relaunches a claude session, since the CLI only honors bypass at launch.
 - `!context` show how full this session's context window is: a breakdown by
-  category (messages, system prompt, tools), the memory files loaded, and
-  whether autocompact is on. Every turn's `Done` line also carries the
-  percentage, which costs nothing extra — it comes from usage the turn already
-  reports.
+  category for claude (messages, system prompt, tools), token totals for both,
+  and whether autocompact is on. Every turn's `Done` line also carries the
+  percentage plus an accurate dollar figure: cost shown is *that run's* share,
+  with the session total alongside once they meaningfully differ.
 - `!handoff` carry this session into a fresh thread. The outgoing session
-  writes its own handoff brief (it still has the full context, so nothing else
-  summarizes it as well); that brief, the recent exchange, and the repo's
-  actual state — branch, HEAD, uncommitted diffstat — seed the new session.
-  The old thread is stopped, archived, and linked to the new one.
+  writes its own handoff brief; that brief, the recent exchange, and the
+  repo's actual state seed the new session. The old thread is stopped,
+  archived, and linked to the new one.
 - `!auto-approve` (also `!auto`) open a panel to choose which tools run
   without asking — see Approvals below
 - `!view` open a panel to toggle what shows (thinking, tool calls, tool
@@ -101,6 +120,17 @@ Type them in any channel with the prefix (default `!`).
   binding for good.
 - `!help` list commands
 
+## Live output
+
+A turn holds the typing indicator while it works, including while it waits on
+your approval. Messages sent mid-turn are queued and tell you so ("⏳ Queued
+behind work still running here") instead of vanishing silently.
+
+When a turn ends but background work keeps going — subagents finishing after
+their result frame, continuations waking the parent — a watcher drains that
+output and posts it as it lands, so nothing waits for your next message to
+drag it out.
+
 ## Tests
 
 ```
@@ -109,14 +139,16 @@ make test
 
 Installs anything missing into `.venv` and runs pytest. No Discord connection
 and no API calls — the SDK message types are constructed directly and the
-Discord objects are stubbed, so the suite runs offline in about a second.
+Discord objects are stubbed, so the suite runs offline in a couple of seconds.
 
 What it pins is mostly the non-obvious behaviour that was expensive to get
 right: where a turn ends when a subagent settles before its result frame, that
-the context warning is dispatched outside the session lock (inside it, the
-handoff action deadlocks on its own `ask`), that `acceptEdits` waves through
-edits without consulting the broker, and that an auto-approve toggle follows
-the tool name rather than its row on the page.
+context math reads the *last request's* input side rather than the session's
+cumulative totals, that the Done line reports each run's cost as the delta of
+the cumulative figure, that late output is drained without waiting for another
+message, that `acceptEdits` waves through edits without consulting the broker,
+and that an auto-approve toggle follows the tool name rather than its row on
+the page.
 
 ## Context management
 

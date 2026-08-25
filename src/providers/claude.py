@@ -57,6 +57,11 @@ from src.providers.base import (
 
 log = logging.getLogger("src")
 
+NAME = "claude"
+
+#: Permission modes the CLI accepts, in our normalized naming.
+MODES = ("default", "acceptEdits", "auto", "plan", "bypassPermissions")
+
 _SETTING_SOURCES = ["user", "project", "local"]
 
 # Task types whose completion wakes the parent for a follow-up turn, so a
@@ -192,6 +197,7 @@ def _build_options(
     model: str | None,
     can_use_tool: Any = None,
     permission_mode: str = "default",
+    env: dict[str, str] | None = None,
 ) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         cwd=cwd,
@@ -203,7 +209,42 @@ def _build_options(
         model=model,
         skills=skills,
         setting_sources=_SETTING_SOURCES,
+        env=env,
     )
+
+
+def create(
+    *,
+    cwd: str,
+    channel_id: int,
+    broker: PermissionBroker,
+    model: str | None = None,
+    resume: str | None = None,
+    session_id: str | None = None,
+    mode: str = "default",
+    options: dict[str, Any] | None = None,
+) -> "ClaudeProvider":
+    """Registry entry point; `options` carries claude-specific extras."""
+    extra = options or {}
+    provider = ClaudeProvider(
+        cwd=cwd,
+        channel_id=channel_id,
+        broker=broker,
+        # Deliberately empty: an allowed_tools entry is honoured by the SDK
+        # before can_use_tool runs, so the broker would never see the call,
+        # could not learn the tool's name, and the panel could not turn it
+        # back off. Approval is decided there.
+        allowed_tools=[],
+        skills=extra.get("skills", "all"),
+        model=model,
+        resume=resume,
+        session_id=session_id,
+        permission_mode=mode,
+    )
+    token = extra.get("anthropic_token")
+    if token:
+        provider.extra_env = {"CLAUDE_CODE_OAUTH_TOKEN": token}
+    return provider
 
 
 async def fetch_commands(
@@ -258,30 +299,63 @@ def _format_ask_question(tool_input: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def _context_from_usage(model_usage: dict[str, Any] | None) -> ContextState | None:
-    """Context fullness from a result's per-model usage.
+def _context_from_usage(
+    request_usage: dict[str, Any] | None,
+    model_usage: dict[str, Any] | None,
+) -> ContextState | None:
+    """Context fullness as of the end of a run.
 
-    `model_usage` has one entry per model that ran, and a subagent on a
-    smaller model would skew any total. The fullest window is the one that
-    matters -- it is the one that will force a compaction -- so entries are
-    scored individually and the highest kept.
+    Two sources ride along on a result, and they answer different questions:
+    `model_usage` holds *cumulative* totals across the whole session -- summing
+    them against a single-turn window produced nonsense like 6000% -- while the
+    last assistant message's `usage` describes exactly one API request, whose
+    input side *is* what the window must hold. So the request usage supplies
+    `used`, and the (constant) per-model `contextWindow` supplies `limit`. The
+    cumulative breakdown is consulted only when no assistant usage was seen.
     """
-    best: ContextState | None = None
+    limit = 0
+    limit_model: str | None = None
     for name, usage in (model_usage or {}).items():
         if not isinstance(usage, dict):
             continue
-        limit = usage.get("contextWindow") or 0
-        if limit <= 0:
-            continue
+        window = usage.get("contextWindow") or 0
+        if window > limit:
+            limit = window
+            limit_model = name
+
+    used = 0
+    if isinstance(request_usage, dict):
         used = (
-            (usage.get("inputTokens") or 0)
-            + (usage.get("cacheReadInputTokens") or 0)
-            + (usage.get("cacheCreationInputTokens") or 0)
+            _usage_field(request_usage, "input_tokens", "inputTokens")
+            + _usage_field(request_usage, "cache_read_input_tokens", "cacheReadInputTokens")
+            + _usage_field(request_usage, "cache_creation_input_tokens", "cacheCreationInputTokens")
         )
-        state = ContextState(used=used, limit=limit, model=name)
-        if best is None or state.pct > best.pct:
-            best = state
-    return best
+    else:
+        # No assistant message carried usage (e.g. an errored first turn);
+        # fall back to the newest single-model cumulative row rather than a sum.
+        best: tuple[int, str] | None = None
+        for name, usage in (model_usage or {}).items():
+            if not isinstance(usage, dict):
+                continue
+            total = (
+                (usage.get("inputTokens") or 0)
+                + (usage.get("cacheReadInputTokens") or 0)
+                + (usage.get("cacheCreationInputTokens") or 0)
+            )
+            if best is None or total > best[0]:
+                best = (total, name)
+        if best is not None:
+            used = min(best[0], limit) if limit else best[0]
+            limit_model = best[1]
+
+    if limit <= 0:
+        return None
+    return ContextState(used=min(used, limit), limit=limit, model=limit_model)
+
+
+def _usage_field(usage: dict[str, Any], snake: str, camel: str) -> int:
+    value = usage.get(snake, usage.get(camel)) or 0
+    return value if isinstance(value, (int, float)) else 0
 
 
 def _format_task_usage(usage: dict[str, Any] | None) -> str:
@@ -349,6 +423,9 @@ class ClaudeProvider(Provider):
         self._new_session_id = session_id
         self.session_id = resume or session_id
         self.permission_mode = permission_mode
+        #: Extra environment for the CLI process (e.g. an OAuth token from a
+        #: remote login). Set by the registry factory.
+        self.extra_env: dict[str, str] | None = None
         self._client: ClaudeSDKClient | None = None
         # A background task continuously drains the SDK's message stream into
         # this queue, and every turn pulls from the queue instead of the
@@ -367,6 +444,12 @@ class ClaudeProvider(Provider):
         # Set when a turn gives up after _IDLE_TIMEOUT of silence. Cleared by
         # _drain_stale once it has flushed whatever arrived late.
         self._stalled = False
+        #: The input-side usage of the most recent main-chain assistant
+        #: message -- one API request's worth, which is what fills the window.
+        self._request_usage: dict[str, Any] | None = None
+        #: Highest session-cumulative cost reported so far, so a result's
+        #: total can be split into this turn's share and the running total.
+        self._cost_seen = 0.0
 
     async def _can_use_tool(self, tool_name, tool_input, context):  # noqa: ANN001
         # AskUserQuestion is not an approval; poll the user and feed the answer
@@ -393,6 +476,7 @@ class ClaudeProvider(Provider):
             model=self.model,
             can_use_tool=self._can_use_tool,
             permission_mode=self.permission_mode,
+            env=self.extra_env,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -462,13 +546,36 @@ class ClaudeProvider(Provider):
         answered — the "one turn behind" failure. Flushing first keeps the
         stream and the turn boundaries aligned.
         """
-        if not self._stalled and self._queue.empty():
+        async for block in self._drain(first_wait=None):
+            yield block
+
+    async def drain_pending(self, first_wait: float = 0.0) -> AsyncIterator[Block]:
+        """Output that finished after its turn ended (late tasks, continuations).
+
+        Called by the session right after a turn closes so this surfaces
+        immediately instead of waiting for the next user message.
+        """
+        async for block in self._drain(first_wait=first_wait or None):
+            yield block
+
+    async def _drain(self, first_wait: float | None = None) -> AsyncIterator[Block]:
+        """Yield queued blocks until the stream has been quiet for a moment.
+
+        `first_wait` is how long to wait for a *first* item when there is no
+        known backlog; once anything arrives, subsequent reads use the short
+        quiet gap. With `first_wait=None` and an idle queue this returns
+        immediately -- the pre-turn flush must not cost a quiet-period wait.
+        """
+        backlog = self._stalled or not self._queue.empty()
+        if not backlog and not first_wait:
             return
         while True:
+            timeout = _DRAIN_QUIET if backlog else first_wait
             try:
-                item = await asyncio.wait_for(self._queue.get(), timeout=_DRAIN_QUIET)
+                item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
             except TimeoutError:
                 break
+            backlog = True
             if isinstance(item, BaseException):
                 # The stream died while we were away. Leave it queued-shaped
                 # for the turn proper to raise rather than losing it here.
@@ -565,13 +672,34 @@ class ClaudeProvider(Provider):
 
     def _done_block(self, message: ResultMessage) -> Block:
         bits = [f"{message.num_turns} turn(s)"]
-        if message.total_cost_usd:
-            bits.append(f"${message.total_cost_usd:.4f}")
-        state = _context_from_usage(message.model_usage)
+        cost = self._cost_from_result(message)
+        if cost is not None:
+            turn_cost, total_cost = cost
+            if abs(turn_cost - total_cost) < 0.005 or total_cost <= 0:
+                bits.append(f"${turn_cost:.4f}")
+            else:
+                bits.append(f"${turn_cost:.4f} this run · ${total_cost:.2f} session")
+        state = _context_from_usage(self._request_usage, message.model_usage)
         if state is not None:
             self.last_context = state
             bits.append(f"{state.pct:.0f}% ctx")
         return Block(BlockKind.STATUS, title="Done", body=" · ".join(bits))
+
+    def _cost_from_result(self, message: ResultMessage) -> tuple[float, float] | None:
+        """(this run's cost, session total), from the cumulative report.
+
+        `total_cost_usd` accumulates over the CLI process's life, so printing
+        it per turn overstated every line. The difference against what we have
+        already shown is this run's share. A total that goes *down* means the
+        process restarted and the number reset; treat the new value as both.
+        """
+        reported = message.total_cost_usd
+        if not isinstance(reported, (int, float)) or reported <= 0:
+            return None
+        total = float(reported)
+        turn = total - self._cost_seen if total > self._cost_seen else total
+        self._cost_seen = max(self._cost_seen, total)
+        return max(turn, 0.0), total
 
     async def context_usage(self) -> dict[str, Any] | None:
         if self._client is None:
@@ -647,6 +775,10 @@ class ClaudeProvider(Provider):
         if isinstance(message, AssistantMessage):
             if message.session_id:
                 self.session_id = message.session_id
+            if not message.parent_tool_use_id and isinstance(message.usage, dict):
+                # Main-chain only: a subagent's request says nothing about how
+                # full the parent conversation is.
+                self._request_usage = message.usage
             for b in message.content:
                 if isinstance(b, TextBlock):
                     if b.text.strip():

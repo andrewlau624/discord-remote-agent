@@ -8,7 +8,7 @@ model = ""
 # Base path for new sessions. "new" with no arg starts here, and "new myrepo"
 # resolves to "<default_cwd>/myrepo". Full paths still work. Blank uses the
 # directory the bot was launched from.
-default_cwd = ""
+default_cwd = "/Users/andrewlau/Documents/Pacific/"
 # Seconds to wait for a tool approval before denying.
 approval_timeout = 300
 # SQLite file for channel pins.
@@ -28,3 +28,8 @@ auto_approve = ["Read", "Glob", "Grep", "NotebookRead", "TodoWrite", "Bash"]
 # to turn the warnings off.
 warn_at = 75
 warn_again_at = 90
+
+# Per-provider settings. `bot.model` covers Claude; opencode's model is set
+# here as "provider/model". Leave commented to use opencode's own default.
+# [providers.opencode]
+# model = "anthropic/claude-opus-4-6"

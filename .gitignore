@@ -5,6 +5,7 @@
 *.sqlite3
 prefs.json
 approvals.json
+auth.json
 
 # python
 __pycache__/

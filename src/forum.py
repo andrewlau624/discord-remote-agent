@@ -1,8 +1,9 @@
-"""The 'sessions' forum: one forum post (thread) per agent session.
+"""The sessions forums: one thread per agent session, grouped by provider.
 
-Each session lives in its own thread under a forum channel named 'sessions',
-created on demand. The thread name is the session title; the starter post carries
-the repo, branch, working directory, and session id.
+Each provider gets its own forum channel -- `sessions-claude`, `sessions-opencode`
+-- so threads never mix agents and the forum name doubles as a picker. The
+starter post carries the repo, branch, working directory, provider and session
+id.
 """
 
 from __future__ import annotations
@@ -13,7 +14,10 @@ import subprocess
 
 import discord
 
-FORUM_NAME = "sessions"
+
+def forum_name(provider: str) -> str:
+    """Forum channel for one provider's session threads."""
+    return f"sessions-{provider}"
 
 
 def _run_git(cwd: str, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -158,19 +162,23 @@ def git_info(cwd: str) -> tuple[str, str]:
     return repo or "repo", branch
 
 
-async def ensure_forum(guild: discord.Guild) -> discord.ForumChannel:
-    """Find the 'sessions' forum, creating it if needed."""
+async def ensure_forum(guild: discord.Guild, provider: str = "claude") -> discord.ForumChannel:
+    """Find the provider's sessions forum, creating it if needed."""
+    name = forum_name(provider)
     for channel in guild.channels:
-        if isinstance(channel, discord.ForumChannel) and channel.name == FORUM_NAME:
+        if isinstance(channel, discord.ForumChannel) and channel.name == name:
             return channel
     return await guild.create_forum(
-        name=FORUM_NAME, reason="discord-remote-agent session threads"
+        name=name, reason="discord-remote-agent session threads"
     )
 
 
-def _session_embed(title: str, session_id: str, cwd: str) -> discord.Embed:
+def _session_embed(
+    title: str, session_id: str, cwd: str, provider: str = "claude"
+) -> discord.Embed:
     repo, branch = git_info(cwd)
     embed = discord.Embed(title=title[:256], color=0x5865F2)
+    embed.add_field(name="provider", value=provider, inline=True)
     embed.add_field(name="repo", value=repo, inline=True)
     embed.add_field(name="branch", value=branch, inline=True)
     embed.add_field(name="cwd", value=f"`{cwd}`", inline=False)
@@ -179,12 +187,16 @@ def _session_embed(title: str, session_id: str, cwd: str) -> discord.Embed:
 
 
 async def create_session_thread(
-    forum: discord.ForumChannel, name: str, session_id: str, cwd: str
+    forum: discord.ForumChannel,
+    name: str,
+    session_id: str,
+    cwd: str,
+    provider: str = "claude",
 ) -> discord.Thread:
     """Create a forum post for a session and return its thread."""
     result = await forum.create_thread(
         name=(name or "session")[:100],
-        embed=_session_embed(name or "session", session_id, cwd),
+        embed=_session_embed(name or "session", session_id, cwd, provider),
         reason="new agent session",
     )
     return result.thread
