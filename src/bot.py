@@ -163,7 +163,7 @@ class RemoteAgentBot(commands.Bot):
         # Named Anthropic accounts for remote login/switching; the active
         # token is injected into newly launched Claude sessions.
         self.auth = AuthStore.load(str(Path(config.db_path).with_name("auth.json")))
-        self.login = LoginManager(self.auth)
+        self.login_manager = LoginManager(self.auth)
 
     async def setup_hook(self) -> None:
         register_chat(self)
@@ -811,10 +811,10 @@ class RemoteAgentBot(commands.Bot):
         # A login code reply is consumed by the login flow, not a turn --
         # unless it is a command, so `cancel-login` stays reachable.
         if (
-            self.login.waiting_channel == message.channel.id
+            self.login_manager.waiting_channel == message.channel.id
             and not message.content.startswith(self.config.prefix)
         ):
-            result = await self.login.submit(message.content)
+            result = await self.login_manager.submit(message.content)
             await message.channel.send(result)
             return
         # A pending "Other" answer is captured by the broker, not a new turn.
@@ -928,7 +928,7 @@ def register_chat(bot: RemoteAgentBot) -> None:
             return
         account = (name or f"account-{len(bot.auth.accounts) + 1}").strip()
         try:
-            url = await bot.login.start(ctx.channel.id, account)
+            url = await bot.login_manager.start(ctx.channel.id, account)
         except RuntimeError as exc:
             await ctx.channel.send(f"Login failed to start: `{exc}`")
             return
@@ -940,7 +940,7 @@ def register_chat(bot: RemoteAgentBot) -> None:
 
     @bot.command(name="cancel-login")
     async def cancel_login_cmd(ctx: commands.Context) -> None:
-        await bot.login.cancel()
+        await bot.login_manager.cancel()
         await ctx.channel.send("Login cancelled.")
 
     @bot.command(name="accounts")
